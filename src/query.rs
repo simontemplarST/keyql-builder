@@ -1,118 +1,145 @@
-//! Query model and KeyQL generator for Microsoft Purview eDiscovery.
+//! Search request model and KeyQL generator for Microsoft Purview eDiscovery.
 //!
-//! The model mirrors the form in the UI. `QuerySpec::build` turns it into a
-//! single KeyQL string plus a list of notices. Everything here is pure so it
-//! can be unit tested without a GUI.
+//! Staff fill in a `SearchRequest` through the wizard. `SearchRequest::build`
+//! turns it into one KeyQL string, which is written to a `.kql` file for the
+//! IT Director, plus plain-language notices. `describe` and `email` give
+//! the plain-English versions shown on the review screen and sent with the
+//! file. Everything here is pure and unit tested.
 //!
-//! Conventions followed (Purview KeyQL / KQL):
-//! - Boolean operators are upper case (`AND`, `OR`, `NOT`, `NEAR(n)`, `ONEAR(n)`).
+//! KeyQL conventions followed (Microsoft Learn, "Keyword queries and search
+//! conditions for eDiscovery"):
+//! - Boolean operators are upper case and always written out.
 //! - Values with spaces or special characters are double quoted.
-//! - Dates are `YYYY-MM-DD`; ranges use `..`; comparisons use `<`, `<=`, `>`, `>=`.
-//! - Only suffix wildcards (`budg*`) are supported by Purview.
+//! - Dates are absolute `YYYY-MM-DD`; `a..b` covers both whole days.
+//! - Only suffix wildcards (`budg*`) are supported.
+//! - KeyQL has no comments, so request details never go into the query.
 
-use chrono::{Duration, NaiveDate};
+use chrono::{Datelike, Duration, NaiveDate};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
-// Option tables shown in the UI
+// Option tables
 // ---------------------------------------------------------------------------
 
-/// `kind:` values supported by Purview, with friendly labels.
-pub const KINDS: &[(&str, &str)] = &[
-    ("email", "Email"),
-    ("docs", "Documents (SharePoint / OneDrive)"),
-    ("microsoftteams", "Microsoft Teams messages"),
-    ("im", "Instant messages / chats"),
-    ("meetings", "Meetings & appointments"),
-    ("contacts", "Contacts"),
-    ("tasks", "Tasks"),
-    ("notes", "Notes"),
-    ("voicemail", "Voicemail"),
-    ("faxes", "Faxes"),
-    ("journals", "Journals"),
-    ("posts", "Posts (public folders)"),
-    ("rssfeeds", "RSS feeds"),
-    ("externaldata", "Third-party / external data"),
+/// An item type the form offers.
+pub struct ItemType {
+    /// `kind:` values it maps to.
+    pub kinds: &'static [&'static str],
+    pub label: &'static str,
+    pub description: &'static str,
+    /// Shown up front; the rest sit under "More types".
+    pub common: bool,
+}
+
+pub const ITEM_TYPES: &[ItemType] = &[
+    ItemType {
+        kinds: &["email"],
+        label: "Email",
+        description: "Messages in Outlook mailboxes",
+        common: true,
+    },
+    ItemType {
+        kinds: &["microsoftteams", "im"],
+        label: "Teams chats and meetings",
+        description: "Teams chats, channel posts, meetings and calls",
+        common: true,
+    },
+    ItemType {
+        kinds: &["docs"],
+        label: "Files in OneDrive and SharePoint",
+        description: "Word, Excel, PDF and other documents",
+        common: true,
+    },
+    ItemType {
+        kinds: &["meetings"],
+        label: "Calendar items",
+        description: "Outlook meetings and appointments",
+        common: false,
+    },
+    ItemType {
+        kinds: &["voicemail"],
+        label: "Voicemail",
+        description: "Voicemail saved in mailboxes",
+        common: false,
+    },
+    ItemType {
+        kinds: &["contacts"],
+        label: "Contacts",
+        description: "Outlook contacts",
+        common: false,
+    },
+    ItemType {
+        kinds: &["tasks"],
+        label: "Tasks",
+        description: "Outlook tasks",
+        common: false,
+    },
+    ItemType {
+        kinds: &["notes"],
+        label: "Notes",
+        description: "Outlook notes",
+        common: false,
+    },
+    ItemType {
+        kinds: &["faxes"],
+        label: "Faxes",
+        description: "Faxes saved in mailboxes",
+        common: false,
+    },
 ];
 
-/// Common file extensions offered as check boxes.
-pub const EXTENSIONS: &[&str] = &[
-    "docx", "doc", "xlsx", "xls", "pptx", "ppt", "pdf", "msg", "eml", "txt", "csv", "one", "vsdx",
-    "zip", "jpg", "png", "mp4",
+/// File types offered as check boxes: (extensions, label).
+pub const FILE_TYPES: &[(&[&str], &str)] = &[
+    (&["docx", "doc"], "Word"),
+    (&["xlsx", "xls", "csv"], "Excel"),
+    (&["pptx", "ppt"], "PowerPoint"),
+    (&["pdf"], "PDF"),
+    (&["msg", "eml"], "Saved emails"),
+    (&["txt"], "Text files"),
+    (&["jpg", "jpeg", "png", "gif"], "Pictures"),
+    (&["mp4", "mov", "mp3", "wav"], "Audio and video"),
+    (&["zip"], "Zip files"),
 ];
 
-/// Common built-in sensitive information types.
-pub const SENSITIVE_TYPES: &[&str] = &[
-    "Credit Card Number",
-    "U.S. Social Security Number (SSN)",
-    "U.S. Individual Taxpayer Identification Number (ITIN)",
-    "U.S. Bank Account Number",
-    "ABA Routing Number",
-    "U.S. Driver's License Number",
-    "U.S. / U.K. Passport Number",
-    "International Banking Account Number (IBAN)",
-    "SWIFT Code",
-    "All Full Names",
-    "All Physical Addresses",
-    "All Medical Terms And Conditions",
-];
-
-/// Properties offered in the "Advanced conditions" builder: (name, hint).
-pub const PROPERTIES: &[(&str, &str)] = &[
-    ("subject", "Email subject"),
-    ("SubjectTitle", "Email subject or document title"),
-    ("from", "Sender"),
-    ("to", "To recipients"),
-    ("cc", "CC recipients"),
-    ("bcc", "BCC recipients"),
-    ("participants", "From/To/CC/BCC (any)"),
-    ("recipients", "To/CC/BCC (any)"),
-    ("sent", "Date sent (YYYY-MM-DD)"),
-    ("received", "Date received (YYYY-MM-DD)"),
-    ("kind", "Item type, e.g. email"),
-    ("HasAttachment", "true / false"),
-    ("AttachmentNames", "Attachment file name"),
-    ("importance", "high / medium / low"),
-    ("IsRead", "true / false"),
-    ("category", "Outlook category"),
-    ("ItemClass", "e.g. IPM.Note"),
-    ("size", "Size in bytes"),
-    ("author", "Document author"),
-    ("title", "Document title"),
-    ("FileName", "Document file name"),
-    ("FileExtension", "e.g. docx"),
-    ("ModifiedBy", "Last modified by"),
-    ("Created", "Date created (YYYY-MM-DD)"),
-    ("LastModifiedTime", "Date last modified (YYYY-MM-DD)"),
-    ("path", "Site or folder URL"),
-    ("site", "Site URL"),
-    ("ContentType", "SharePoint content type"),
-    ("DetectedLanguage", "e.g. en"),
-    ("SensitiveType", "Sensitive info type name"),
+/// Built-in sensitive information types: (Purview name, friendly label).
+pub const SENSITIVE_TYPES: &[(&str, &str)] = &[
+    (
+        "U.S. Social Security Number (SSN)",
+        "Social Security numbers",
+    ),
+    ("Credit Card Number", "Credit card numbers"),
+    ("U.S. Bank Account Number", "Bank account numbers"),
+    ("ABA Routing Number", "Bank routing numbers"),
+    ("U.S. Driver's License Number", "Driver's license numbers"),
+    ("U.S. / U.K. Passport Number", "Passport numbers"),
+    (
+        "U.S. Individual Taxpayer Identification Number (ITIN)",
+        "Taxpayer ID numbers (ITIN)",
+    ),
 ];
 
 // ---------------------------------------------------------------------------
 // Model
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
-pub enum Tri {
-    #[default]
-    Any,
-    Yes,
-    No,
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct About {
+    /// Short name, also used for the file name. Required.
+    pub name: String,
+    pub reason: String,
+    pub needed_by: Option<NaiveDate>,
 }
 
-impl Tri {
-    pub const ALL: [Self; 3] = [Self::Any, Self::Yes, Self::No];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Any => "Doesn't matter",
-            Self::Yes => "Yes",
-            Self::No => "No",
-        }
-    }
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Custodians {
+    /// People whose mailbox / OneDrive the IT Director should search.
+    pub people: Vec<String>,
+    /// Shared mailboxes, Teams or SharePoint sites to search.
+    pub locations: Vec<String>,
+    /// Search everyone in the organisation instead.
+    pub everyone: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
@@ -120,602 +147,241 @@ pub enum KeywordScope {
     #[default]
     Anywhere,
     SubjectTitle,
-    Subject,
-    Title,
-}
-
-impl KeywordScope {
-    pub const ALL: [Self; 4] = [
-        Self::Anywhere,
-        Self::SubjectTitle,
-        Self::Subject,
-        Self::Title,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Anywhere => "Anywhere (body, subject, metadata)",
-            Self::SubjectTitle => "Email subject or document title",
-            Self::Subject => "Email subject only",
-            Self::Title => "Document title only",
-        }
-    }
-
-    fn property(self) -> Option<&'static str> {
-        match self {
-            Self::Anywhere => None,
-            Self::SubjectTitle => Some("SubjectTitle"),
-            Self::Subject => Some("subject"),
-            Self::Title => Some("title"),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Keywords {
-    /// Every word must appear.
-    pub all_words: String,
-    /// Exact phrases separated by `;` or new lines; all must appear.
-    pub phrases: String,
-    /// At least one of these must appear.
-    pub any_words: String,
-    /// None of these may appear.
-    pub none_words: String,
+    /// Words or phrases. An entry with spaces is searched as an exact phrase.
+    pub words: Vec<String>,
+    /// Every entry must appear (otherwise any one is enough).
+    pub match_all: bool,
     pub scope: KeywordScope,
+    /// Leave out items containing any of these.
+    pub none: Vec<String>,
+    /// Pairs of words that must appear close together.
+    pub near: Vec<Near>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
-pub struct Proximity {
+pub struct Near {
     pub first: String,
     pub second: String,
     pub distance: u32,
-    /// `ONEAR` (first must precede second) instead of `NEAR`.
-    pub ordered: bool,
 }
 
-impl Default for Proximity {
+impl Default for Near {
     fn default() -> Self {
         Self {
             first: String::new(),
             second: String::new(),
-            distance: 8,
-            ordered: false,
+            distance: 10,
         }
     }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
-pub enum PersonField {
-    #[default]
-    Participants,
-    From,
-    To,
-    Cc,
-    Bcc,
-    Recipients,
-    Author,
-    ModifiedBy,
-}
-
-impl PersonField {
-    pub const ALL: [Self; 8] = [
-        Self::Participants,
-        Self::From,
-        Self::To,
-        Self::Cc,
-        Self::Bcc,
-        Self::Recipients,
-        Self::Author,
-        Self::ModifiedBy,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Participants => "Any participant (from/to/cc/bcc)",
-            Self::From => "From (sender)",
-            Self::To => "To",
-            Self::Cc => "CC",
-            Self::Bcc => "BCC",
-            Self::Recipients => "Any recipient (to/cc/bcc)",
-            Self::Author => "Document author",
-            Self::ModifiedBy => "Document modified by",
-        }
-    }
-
-    pub fn property(self) -> &'static str {
-        match self {
-            Self::Participants => "participants",
-            Self::From => "from",
-            Self::To => "to",
-            Self::Cc => "cc",
-            Self::Bcc => "bcc",
-            Self::Recipients => "recipients",
-            Self::Author => "author",
-            Self::ModifiedBy => "ModifiedBy",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct PersonCond {
-    pub field: PersonField,
-    /// Addresses, names or domains separated by commas, semicolons or new lines.
-    pub values: String,
-    pub exclude: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum DateField {
     #[default]
-    AnyItemDate,
+    Any,
     Sent,
     Received,
     Created,
-    LastModified,
+    Modified,
 }
 
 impl DateField {
     pub const ALL: [Self; 5] = [
-        Self::AnyItemDate,
+        Self::Any,
         Self::Sent,
         Self::Received,
         Self::Created,
-        Self::LastModified,
+        Self::Modified,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::AnyItemDate => "Email sent/received or document modified",
-            Self::Sent => "Email sent",
-            Self::Received => "Email received",
-            Self::Created => "Document created",
-            Self::LastModified => "Document last modified",
+            Self::Any => "Any date (sent, received or last changed)",
+            Self::Sent => "The date an email was sent",
+            Self::Received => "The date an email was received",
+            Self::Created => "The date a file was created",
+            Self::Modified => "The date a file was last changed",
+        }
+    }
+
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Any => "Dated",
+            Self::Sent => "Sent",
+            Self::Received => "Received",
+            Self::Created => "Created",
+            Self::Modified => "Last changed",
         }
     }
 
     fn properties(self) -> &'static [&'static str] {
         match self {
-            Self::AnyItemDate => &["sent", "received", "LastModifiedTime"],
+            Self::Any => &["sent", "received", "LastModifiedTime"],
             Self::Sent => &["sent"],
             Self::Received => &["received"],
             Self::Created => &["Created"],
-            Self::LastModified => &["LastModifiedTime"],
+            Self::Modified => &["LastModifiedTime"],
         }
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
-pub enum DateOp {
+pub enum DateMode {
     #[default]
-    Between,
-    On,
-    Before,
-    OnOrBefore,
-    After,
-    OnOrAfter,
-    LastNDays,
-    Relative,
-}
-
-impl DateOp {
-    pub const ALL: [Self; 8] = [
-        Self::Between,
-        Self::On,
-        Self::Before,
-        Self::OnOrBefore,
-        Self::After,
-        Self::OnOrAfter,
-        Self::LastNDays,
-        Self::Relative,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Between => "is between",
-            Self::On => "is on",
-            Self::Before => "is before",
-            Self::OnOrBefore => "is on or before",
-            Self::After => "is after",
-            Self::OnOrAfter => "is on or after",
-            Self::LastNDays => "is within the last N days",
-            Self::Relative => "is in a relative period",
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
-pub enum RelativeDate {
-    Today,
-    Yesterday,
-    #[default]
-    ThisWeek,
-    ThisMonth,
-    LastMonth,
+    AnyTime,
+    Last30Days,
+    Last12Months,
     ThisYear,
     LastYear,
+    Between,
+    OnOrAfter,
+    OnOrBefore,
 }
 
-impl RelativeDate {
-    pub const ALL: [Self; 7] = [
-        Self::Today,
-        Self::Yesterday,
-        Self::ThisWeek,
-        Self::ThisMonth,
-        Self::LastMonth,
+impl DateMode {
+    pub const ALL: [Self; 8] = [
+        Self::AnyTime,
+        Self::Last30Days,
+        Self::Last12Months,
         Self::ThisYear,
         Self::LastYear,
+        Self::Between,
+        Self::OnOrAfter,
+        Self::OnOrBefore,
     ];
-
-    fn keyword(self) -> &'static str {
-        match self {
-            Self::Today => "today",
-            Self::Yesterday => "yesterday",
-            Self::ThisWeek => "\"this week\"",
-            Self::ThisMonth => "\"this month\"",
-            Self::LastMonth => "\"last month\"",
-            Self::ThisYear => "\"this year\"",
-            Self::LastYear => "\"last year\"",
-        }
-    }
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Today => "Today",
-            Self::Yesterday => "Yesterday",
-            Self::ThisWeek => "This week",
-            Self::ThisMonth => "This month",
-            Self::LastMonth => "Last month",
+            Self::AnyTime => "Any time",
+            Self::Last30Days => "Last 30 days",
+            Self::Last12Months => "Last 12 months",
             Self::ThisYear => "This year",
             Self::LastYear => "Last year",
+            Self::Between => "Between two dates",
+            Self::OnOrAfter => "On or after a date",
+            Self::OnOrBefore => "On or before a date",
         }
+    }
+
+    /// The fixed range a choice stands for, as of `today`. `None` = no limit
+    /// on that side.
+    pub fn range(
+        self,
+        start: NaiveDate,
+        end: NaiveDate,
+        today: NaiveDate,
+    ) -> Option<(Option<NaiveDate>, Option<NaiveDate>)> {
+        let ymd = |y, m, d| NaiveDate::from_ymd_opt(y, m, d).unwrap_or(today);
+        Some(match self {
+            Self::AnyTime => return None,
+            Self::Last30Days => (Some(today - Duration::days(30)), Some(today)),
+            Self::Last12Months => (
+                Some(
+                    today
+                        .with_year(today.year() - 1)
+                        .unwrap_or(today - Duration::days(365)),
+                ),
+                Some(today),
+            ),
+            Self::ThisYear => (Some(ymd(today.year(), 1, 1)), Some(today)),
+            Self::LastYear => (
+                Some(ymd(today.year() - 1, 1, 1)),
+                Some(ymd(today.year() - 1, 12, 31)),
+            ),
+            Self::Between => {
+                let (a, b) = if start <= end {
+                    (start, end)
+                } else {
+                    (end, start)
+                };
+                (Some(a), Some(b))
+            }
+            Self::OnOrAfter => (Some(start), None),
+            Self::OnOrBefore => (None, Some(end)),
+        })
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
-pub struct DateCond {
+pub struct Dates {
+    pub mode: DateMode,
     pub field: DateField,
-    pub op: DateOp,
     pub start: NaiveDate,
     pub end: NaiveDate,
-    pub days: u32,
-    pub relative: RelativeDate,
 }
 
-impl DateCond {
+impl Dates {
     pub fn new(today: NaiveDate) -> Self {
         Self {
-            field: DateField::default(),
-            op: DateOp::default(),
-            start: today - Duration::days(30),
+            mode: DateMode::AnyTime,
+            field: DateField::Any,
+            start: NaiveDate::from_ymd_opt(today.year(), 1, 1).unwrap_or(today),
             end: today,
-            days: 30,
-            relative: RelativeDate::default(),
         }
     }
 }
 
-impl Default for DateCond {
+impl Default for Dates {
     fn default() -> Self {
         Self::new(chrono::Local::now().date_naive())
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
-pub enum Importance {
+pub enum Attachments {
     #[default]
     Any,
-    High,
-    Normal,
-    Low,
-}
-
-impl Importance {
-    pub const ALL: [Self; 4] = [Self::Any, Self::High, Self::Normal, Self::Low];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Any => "Any",
-            Self::High => "High",
-            Self::Normal => "Normal",
-            Self::Low => "Low",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct EmailOpts {
-    pub has_attachment: Tri,
-    pub importance: Importance,
-    pub is_read: Tri,
-    /// Attachment names, comma/semicolon/new-line separated (any of).
-    pub attachment_names: String,
-    /// Outlook categories (any of).
-    pub categories: String,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct DocOpts {
-    /// Extensions picked from `EXTENSIONS`.
-    pub extensions: Vec<String>,
-    /// Extra extensions typed by the user.
-    pub custom_extensions: String,
-    /// File names (any of). Trailing `*` allowed.
-    pub file_names: String,
-    /// Site / folder URLs (any of), emitted as `path:`.
-    pub paths: String,
+    With,
+    Without,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum SizeOp {
     #[default]
     Any,
-    LessThan,
-    GreaterThan,
-    Between,
+    LargerThan,
+    SmallerThan,
 }
 
-impl SizeOp {
-    pub const ALL: [Self; 4] = [Self::Any, Self::LessThan, Self::GreaterThan, Self::Between];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Any => "Any size",
-            Self::LessThan => "Smaller than",
-            Self::GreaterThan => "Larger than",
-            Self::Between => "Between",
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
-pub enum SizeUnit {
-    Bytes,
-    #[default]
-    KB,
-    MB,
-    GB,
-}
-
-impl SizeUnit {
-    pub const ALL: [Self; 4] = [Self::Bytes, Self::KB, Self::MB, Self::GB];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Bytes => "bytes",
-            Self::KB => "KB",
-            Self::MB => "MB",
-            Self::GB => "GB",
-        }
-    }
-
-    fn factor(self) -> f64 {
-        match self {
-            Self::Bytes => 1.0,
-            Self::KB => 1024.0,
-            Self::MB => 1024.0 * 1024.0,
-            Self::GB => 1024.0 * 1024.0 * 1024.0,
-        }
-    }
-}
-
+/// Optional filters ("Narrow it down").
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
-pub struct SizeCond {
-    pub op: SizeOp,
-    pub a: f64,
-    pub b: f64,
-    pub unit: SizeUnit,
+pub struct Filters {
+    pub sent_by: Vec<String>,
+    pub sent_to: Vec<String>,
+    pub leave_out_people: Vec<String>,
+    pub attachments: Attachments,
+    pub attachment_names: Vec<String>,
+    pub high_importance: bool,
+    /// Labels from `FILE_TYPES`.
+    pub file_types: Vec<String>,
+    pub other_extensions: Vec<String>,
+    pub file_names: Vec<String>,
+    pub authors: Vec<String>,
+    pub size_op: SizeOp,
+    pub size_mb: f64,
+    /// Purview names from `SENSITIVE_TYPES`.
+    pub sensitive: Vec<String>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
-pub enum Confidence {
-    #[default]
-    Any,
-    Low,
-    Medium,
-    High,
-}
-
-impl Confidence {
-    pub const ALL: [Self; 4] = [Self::Any, Self::Low, Self::Medium, Self::High];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Any => "Any confidence",
-            Self::Low => "Low or higher (65+)",
-            Self::Medium => "Medium or higher (75+)",
-            Self::High => "High (85+)",
-        }
-    }
-
-    fn min(self) -> Option<u32> {
-        match self {
-            Self::Any => None,
-            Self::Low => Some(65),
-            Self::Medium => Some(75),
-            Self::High => Some(85),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SensitiveCond {
-    pub name: String,
-    /// Minimum number of instances (1 = any).
-    pub min_count: u32,
-    pub confidence: Confidence,
-}
-
-impl Default for SensitiveCond {
-    fn default() -> Self {
-        Self {
-            name: SENSITIVE_TYPES[0].to_owned(),
-            min_count: 1,
-            confidence: Confidence::Any,
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
-pub enum Join {
-    #[default]
-    And,
-    Or,
-    AndNot,
-}
-
-impl Join {
-    pub const ALL: [Self; 3] = [Self::And, Self::Or, Self::AndNot];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::And => "AND",
-            Self::Or => "OR",
-            Self::AndNot => "AND NOT",
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
-pub enum CondOp {
-    #[default]
-    Contains,
-    Equals,
-    NotEquals,
-    Less,
-    LessEq,
-    Greater,
-    GreaterEq,
-    Range,
-}
-
-impl CondOp {
-    pub const ALL: [Self; 8] = [
-        Self::Contains,
-        Self::Equals,
-        Self::NotEquals,
-        Self::Less,
-        Self::LessEq,
-        Self::Greater,
-        Self::GreaterEq,
-        Self::Range,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Contains => ": contains / matches",
-            Self::Equals => "= equals",
-            Self::NotEquals => "<> not equal",
-            Self::Less => "< less than",
-            Self::LessEq => "<= at most",
-            Self::Greater => "> greater than",
-            Self::GreaterEq => ">= at least",
-            Self::Range => ".. range",
-        }
-    }
-
-    fn token(self) -> &'static str {
-        match self {
-            Self::Contains | Self::Range => ":",
-            Self::Equals => "=",
-            Self::NotEquals => "<>",
-            Self::Less => "<",
-            Self::LessEq => "<=",
-            Self::Greater => ">",
-            Self::GreaterEq => ">=",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Condition {
-    pub join: Join,
-    pub property: String,
-    pub op: CondOp,
-    pub value: String,
-    pub value2: String,
-}
-
-impl Default for Condition {
-    fn default() -> Self {
-        Self {
-            join: Join::And,
-            property: "subject".to_owned(),
-            op: CondOp::Contains,
-            value: String::new(),
-            value2: String::new(),
-        }
-    }
-}
-
+/// Everything a staff member fills in for one search request.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
-pub struct QuerySpec {
+pub struct SearchRequest {
+    pub about: About,
+    pub custodians: Custodians,
     pub keywords: Keywords,
-    pub proximity: Vec<Proximity>,
-    pub kinds: Vec<String>,
-    pub people: Vec<PersonCond>,
-    pub dates: Vec<DateCond>,
-    pub email: EmailOpts,
-    pub docs: DocOpts,
-    pub size: SizeCond,
-    pub sensitive: Vec<SensitiveCond>,
-    pub advanced: Vec<Condition>,
-    /// Hand-written KeyQL ANDed onto the generated query.
-    pub raw: String,
-}
-
-impl QuerySpec {
-    /// A filled-in sample that shows off most of the form.
-    pub fn example(today: NaiveDate) -> Self {
-        use chrono::Datelike;
-        let year = today.year();
-        Self {
-            keywords: Keywords {
-                all_words: "contract".into(),
-                phrases: "purchase agreement".into(),
-                any_words: "draft revised final".into(),
-                none_words: "newsletter".into(),
-                scope: KeywordScope::Anywhere,
-            },
-            proximity: vec![Proximity {
-                first: "payment".into(),
-                second: "late".into(),
-                distance: 5,
-                ordered: false,
-            }],
-            kinds: vec!["email".into(), "docs".into()],
-            people: vec![PersonCond {
-                field: PersonField::Participants,
-                values: "jane.doe@contoso.com; fabrikam.com".into(),
-                exclude: false,
-            }],
-            dates: vec![DateCond {
-                field: DateField::AnyItemDate,
-                op: DateOp::Between,
-                start: NaiveDate::from_ymd_opt(year, 1, 1).unwrap_or(today),
-                end: today,
-                ..DateCond::new(today)
-            }],
-            email: EmailOpts {
-                has_attachment: Tri::Yes,
-                ..Default::default()
-            },
-            docs: DocOpts {
-                extensions: vec!["docx".into(), "pdf".into()],
-                ..Default::default()
-            },
-            ..Default::default()
-        }
-    }
+    pub dates: Dates,
+    /// Labels from `ITEM_TYPES`. Empty means every type.
+    pub item_types: Vec<String>,
+    pub filters: Filters,
 }
 
 // ---------------------------------------------------------------------------
@@ -724,14 +390,31 @@ impl QuerySpec {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
 pub enum Level {
+    /// Must be fixed before the file can be saved.
     Error,
+    /// Probably a mistake; saving is still allowed.
     Warning,
+    /// Good to know.
     Info,
+}
+
+/// The wizard step a notice belongs to, so the UI can link straight to it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash, Serialize, Deserialize)]
+pub enum Step {
+    #[default]
+    About,
+    Whose,
+    Words,
+    When,
+    Types,
+    Narrow,
+    Review,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Notice {
     pub level: Level,
+    pub step: Step,
     pub message: String,
 }
 
@@ -741,19 +424,32 @@ pub struct Built {
     pub notices: Vec<Notice>,
 }
 
-/// Soft limit for query length. Purview rejects very long queries; around
-/// 4,000 characters is a commonly cited ceiling.
-pub const LENGTH_WARNING: usize = 4000;
+impl Built {
+    pub fn can_save(&self) -> bool {
+        !self.query.is_empty() && !self.notices.iter().any(|n| n.level == Level::Error)
+    }
+
+    pub fn for_step(&self, step: Step) -> impl Iterator<Item = &Notice> {
+        self.notices.iter().filter(move |n| n.step == step)
+    }
+}
+
+/// Purview's limit for SharePoint/OneDrive search queries.
+pub const LENGTH_LIMIT: usize = 4000;
 
 struct Ctx<'a> {
     notices: &'a mut Vec<Notice>,
 }
 
 impl Ctx<'_> {
-    fn push(&mut self, level: Level, message: impl Into<String>) {
+    fn push(&mut self, level: Level, step: Step, message: impl Into<String>) {
         let message = message.into();
         if !self.notices.iter().any(|n| n.message == message) {
-            self.notices.push(Notice { level, message });
+            self.notices.push(Notice {
+                level,
+                step,
+                message,
+            });
         }
     }
 }
@@ -764,41 +460,41 @@ impl Ctx<'_> {
 
 const RESERVED: &[&str] = &["AND", "OR", "NOT", "NEAR", "ONEAR", "XRANK", "WORDS"];
 
-/// Format one free-text term or property value, quoting when needed.
-/// Returns `None` for empty input.
-fn term(raw: &str, cx: &mut Ctx) -> Option<String> {
-    let mut s = raw.trim();
-    if s.is_empty() {
-        return None;
-    }
-    let was_quoted = s.len() >= 2 && s.starts_with('"') && s.ends_with('"');
-    if was_quoted {
-        s = &s[1..s.len() - 1];
-    }
-    if s.contains('"') {
-        cx.push(
-            Level::Warning,
-            "Double quotes inside a value were removed (KeyQL cannot escape them).",
-        );
-    }
-    let cleaned = s
-        .replace('"', " ")
+/// Tidy one entry as typed: drops double quotes and collapses whitespace.
+pub fn clean_entry(raw: &str) -> String {
+    raw.replace('"', " ")
         .split_whitespace()
         .collect::<Vec<_>>()
-        .join(" ");
+        .join(" ")
+}
+
+/// Rough check for a person entry: a full address or a bare domain.
+pub fn looks_like_address(entry: &str) -> bool {
+    let e = entry.trim();
+    match e.split_once('@') {
+        Some((user, domain)) => !user.is_empty() && domain.contains('.') && !domain.ends_with('.'),
+        None => !e.contains(' ') && e.contains('.') && !e.starts_with('.') && !e.ends_with('.'),
+    }
+}
+
+fn term(raw: &str, step: Step, cx: &mut Ctx) -> Option<String> {
+    let cleaned = clean_entry(raw);
     if cleaned.is_empty() {
         return None;
     }
     if cleaned.starts_with('*') || cleaned.starts_with('?') {
         cx.push(
             Level::Warning,
-            format!("'{cleaned}': Purview only supports wildcards at the end of a word (suffix), not the start."),
+            step,
+            format!(
+                "\"{cleaned}\" starts with *. A * only works at the end of a word \
+                 (for example budg* finds budget and budgets)."
+            ),
         );
     }
-    let needs_quotes = was_quoted
-        || cleaned
-            .chars()
-            .any(|c| c.is_whitespace() || "():<>=,;[]{}\\^~".contains(c))
+    let needs_quotes = cleaned
+        .chars()
+        .any(|c| c.is_whitespace() || "():<>=,;[]{}\\^~".contains(c))
         || cleaned.starts_with('-')
         || cleaned.starts_with('+')
         || RESERVED.contains(&cleaned.as_str());
@@ -809,54 +505,6 @@ fn term(raw: &str, cx: &mut Ctx) -> Option<String> {
     })
 }
 
-/// Split free text into terms on whitespace, keeping "quoted phrases" whole.
-pub fn tokenize(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut in_quotes = false;
-    for c in text.chars() {
-        match c {
-            '"' => {
-                cur.push(c);
-                if in_quotes {
-                    out.push(std::mem::take(&mut cur));
-                }
-                in_quotes = !in_quotes;
-            }
-            c if c.is_whitespace() && !in_quotes => {
-                if !cur.is_empty() {
-                    out.push(std::mem::take(&mut cur));
-                }
-            }
-            c => cur.push(c),
-        }
-    }
-    if !cur.trim().is_empty() {
-        if in_quotes {
-            cur.push('"');
-        }
-        out.push(cur);
-    }
-    out.retain(|t| !t.trim_matches('"').trim().is_empty());
-    out
-}
-
-/// Split the exact-phrase field on semicolons and new lines (commas may be part of a phrase).
-pub fn split_phrases(text: &str) -> Vec<String> {
-    text.split([';', '\n'])
-        .map(|s| s.trim().trim_matches('"').trim().to_owned())
-        .filter(|s| !s.is_empty())
-        .collect()
-}
-
-/// Split a list field on commas, semicolons and new lines.
-pub fn split_list(text: &str) -> Vec<String> {
-    text.split([',', ';', '\n'])
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty())
-        .collect()
-}
-
 fn group(parts: &[String], op: &str) -> Option<String> {
     match parts.len() {
         0 => None,
@@ -865,70 +513,66 @@ fn group(parts: &[String], op: &str) -> Option<String> {
     }
 }
 
-fn scoped(prop: Option<&str>, value: &str) -> String {
-    match prop {
-        Some(p) => format!("{p}:{value}"),
-        None => value.to_owned(),
-    }
-}
-
-fn prop_any(prop: &str, values: &[String], cx: &mut Ctx) -> Option<String> {
-    let parts: Vec<String> = values
+fn terms(values: &[String], prop: Option<&str>, step: Step, cx: &mut Ctx) -> Vec<String> {
+    values
         .iter()
-        .filter_map(|v| term(v, cx))
-        .map(|v| format!("{prop}:{v}"))
-        .collect();
-    group(&parts, "OR")
-}
-
-fn terms(text: &str, prop: Option<&str>, cx: &mut Ctx) -> Vec<String> {
-    tokenize(text)
-        .iter()
-        .filter_map(|t| term(t, cx))
-        .map(|t| scoped(prop, &t))
+        .filter_map(|v| term(v, step, cx))
+        .map(|v| match prop {
+            Some(p) => format!("{p}:{v}"),
+            None => v,
+        })
         .collect()
 }
 
-fn date(d: NaiveDate) -> String {
+fn any_of(values: &[String], prop: &str, step: Step, cx: &mut Ctx) -> Option<String> {
+    group(&terms(values, Some(prop), step, cx), "OR")
+}
+
+fn check_people(values: &[String], step: Step, cx: &mut Ctx) {
+    for v in values {
+        let v = clean_entry(v);
+        if !v.is_empty() && !looks_like_address(&v) {
+            cx.push(
+                Level::Warning,
+                step,
+                format!(
+                    "\"{v}\" isn't a full email address. Names can match the wrong person, so use \
+                     addresses like name@example.gov where you can."
+                ),
+            );
+        }
+    }
+}
+
+fn iso(d: NaiveDate) -> String {
     d.format("%Y-%m-%d").to_string()
 }
 
-fn number(n: f64) -> String {
-    format!("{}", n.max(0.0).round() as i64)
+/// "March 5, 2026"
+pub fn long_date(d: NaiveDate) -> String {
+    d.format("%B %-d, %Y").to_string()
 }
 
-/// Rough check that a hand-written KeyQL fragment is well formed.
-fn check_raw(raw: &str, label: &str, cx: &mut Ctx) {
-    if raw.chars().filter(|&c| c == '"').count() % 2 != 0 {
-        cx.push(Level::Error, format!("{label}: unbalanced double quote."));
-    }
-    let mut depth = 0i32;
-    let mut in_q = false;
-    for c in raw.chars() {
-        match c {
-            '"' => in_q = !in_q,
-            '(' if !in_q => depth += 1,
-            ')' if !in_q => {
-                depth -= 1;
-                if depth < 0 {
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    if depth != 0 {
-        cx.push(Level::Error, format!("{label}: unbalanced parentheses."));
-    }
-    for w in raw.split_whitespace() {
-        if matches!(w.to_ascii_lowercase().as_str(), "and" | "or" | "not")
-            && w != w.to_ascii_uppercase()
-        {
-            cx.push(
-                Level::Warning,
-                format!("{label}: '{w}' is not upper case, so Purview searches for it as a word instead of using it as an operator."),
-            );
-        }
+fn non_empty(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .map(|v| clean_entry(v))
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
+/// `"a"`, `"a" or "b"`, `"a", "b" or "c"`.
+fn quoted_list(values: &[String], conj: &str) -> String {
+    let q: Vec<String> = values.iter().map(|v| format!("\"{v}\"")).collect();
+    plain_list(&q, conj)
+}
+
+fn plain_list<S: AsRef<str>>(values: &[S], conj: &str) -> String {
+    let v: Vec<&str> = values.iter().map(AsRef::as_ref).collect();
+    match v.len() {
+        0 => String::new(),
+        1 => v[0].to_owned(),
+        n => format!("{} {conj} {}", v[..n - 1].join(", "), v[n - 1]),
     }
 }
 
@@ -936,13 +580,12 @@ fn check_raw(raw: &str, label: &str, cx: &mut Ctx) {
 // Builder
 // ---------------------------------------------------------------------------
 
-impl QuerySpec {
-    /// Build using today's local date for relative calculations.
+impl SearchRequest {
     pub fn build(&self) -> Built {
         self.build_at(chrono::Local::now().date_naive())
     }
 
-    /// Build with an explicit "today" (for tests and reproducibility).
+    /// Build with an explicit "today", which fixes preset date ranges.
     pub fn build_at(&self, today: NaiveDate) -> Built {
         let mut notices = Vec::new();
         let mut cx = Ctx {
@@ -951,26 +594,168 @@ impl QuerySpec {
         let mut include: Vec<String> = Vec::new();
         let mut exclude: Vec<String> = Vec::new();
 
-        self.build_keywords(&mut include, &mut exclude, &mut cx);
-        self.build_proximity(&mut include, &mut cx);
-
-        let kinds: Vec<String> = self.kinds.iter().map(|k| format!("kind:{k}")).collect();
-        include.extend(group(&kinds, "OR"));
-
-        self.build_people(&mut include, &mut exclude, &mut cx);
-        self.build_dates(&mut include, today, &mut cx);
-        self.build_email(&mut include, &mut cx);
-        self.build_docs(&mut include, &mut cx);
-        self.build_size(&mut include, &mut cx);
-        self.build_sensitive(&mut include, &mut cx);
-        self.build_advanced(&mut include, &mut cx);
-
-        let raw = self.raw.trim();
-        if !raw.is_empty() {
-            check_raw(raw, "Custom KeyQL", &mut cx);
-            include.push(format!("({raw})"));
+        // About / whose content (not part of the query; checked for the email).
+        if self.about.name.trim().is_empty() {
+            cx.push(
+                Level::Error,
+                Step::About,
+                "Give the request a short name. It's used for the file name.",
+            );
+        }
+        let c = &self.custodians;
+        if !c.everyone && non_empty(&c.people).is_empty() && non_empty(&c.locations).is_empty() {
+            cx.push(
+                Level::Warning,
+                Step::Whose,
+                "You haven't said whose content to search. Add people or places, or tick \"Search everyone\".",
+            );
+        }
+        if !c.everyone {
+            check_people(&c.people, Step::Whose, &mut cx);
         }
 
+        // Words
+        let k = &self.keywords;
+        let scope = match k.scope {
+            KeywordScope::Anywhere => None,
+            KeywordScope::SubjectTitle => Some("SubjectTitle"),
+        };
+        let words = terms(&k.words, scope, Step::Words, &mut cx);
+        if k.match_all {
+            include.extend(words);
+        } else {
+            include.extend(group(&words, "OR"));
+        }
+        exclude.extend(terms(&k.none, scope, Step::Words, &mut cx));
+        for p in &k.near {
+            match (term(&p.first, Step::Words, &mut cx), term(&p.second, Step::Words, &mut cx)) {
+                (Some(a), Some(b)) => include.push(format!("({a} NEAR({}) {b})", p.distance.max(1))),
+                (None, None) => {}
+                _ => cx.push(
+                    Level::Error,
+                    Step::Words,
+                    "A \"words close together\" row is missing one of its words. Fill it in or remove the row.",
+                ),
+            }
+        }
+
+        // Dates
+        let d = &self.dates;
+        if d.mode == DateMode::Between && d.start > d.end {
+            cx.push(
+                Level::Info,
+                Step::When,
+                "The start date was after the end date, so they were swapped.",
+            );
+        }
+        if let Some((from, to)) = d.mode.range(d.start, d.end, today) {
+            let restriction = match (from, to) {
+                (Some(a), Some(b)) => format!(":{}..{}", iso(a), iso(b)),
+                (Some(a), None) => format!(">={}", iso(a)),
+                (None, Some(b)) => format!("<={}", iso(b)),
+                (None, None) => unreachable!("every limited date choice has at least one side"),
+            };
+            let parts: Vec<String> = d
+                .field
+                .properties()
+                .iter()
+                .map(|p| format!("{p}{restriction}"))
+                .collect();
+            include.extend(group(&parts, "OR"));
+            if let Some(a) = from
+                && a > today
+            {
+                cx.push(
+                    Level::Warning,
+                    Step::When,
+                    "The dates are in the future, so nothing will be found.",
+                );
+            }
+        }
+
+        // Types
+        let kinds: Vec<String> = ITEM_TYPES
+            .iter()
+            .filter(|t| self.item_types.iter().any(|l| l == t.label))
+            .flat_map(|t| t.kinds.iter().map(|k| format!("kind:{k}")))
+            .collect();
+        include.extend(group(&kinds, "OR"));
+
+        // Narrow it down
+        let f = &self.filters;
+        check_people(&f.sent_by, Step::Narrow, &mut cx);
+        check_people(&f.sent_to, Step::Narrow, &mut cx);
+        check_people(&f.leave_out_people, Step::Narrow, &mut cx);
+        include.extend(any_of(&f.sent_by, "from", Step::Narrow, &mut cx));
+        include.extend(any_of(&f.sent_to, "recipients", Step::Narrow, &mut cx));
+        exclude.extend(any_of(
+            &f.leave_out_people,
+            "participants",
+            Step::Narrow,
+            &mut cx,
+        ));
+        match f.attachments {
+            Attachments::Any => {}
+            Attachments::With => include.push("HasAttachment:true".into()),
+            Attachments::Without => include.push("HasAttachment:false".into()),
+        }
+        include.extend(any_of(
+            &f.attachment_names,
+            "AttachmentNames",
+            Step::Narrow,
+            &mut cx,
+        ));
+        if f.high_importance {
+            include.push("importance:high".into());
+        }
+        let mut exts: Vec<String> = FILE_TYPES
+            .iter()
+            .filter(|(_, label)| f.file_types.iter().any(|l| l == label))
+            .flat_map(|(e, _)| e.iter().map(|s| (*s).to_owned()))
+            .collect();
+        for e in &f.other_extensions {
+            let e = e
+                .trim()
+                .trim_start_matches('*')
+                .trim_start_matches('.')
+                .to_lowercase();
+            if !e.is_empty() && !exts.contains(&e) {
+                exts.push(e);
+            }
+        }
+        include.extend(any_of(&exts, "FileExtension", Step::Narrow, &mut cx));
+        include.extend(any_of(&f.file_names, "FileName", Step::Narrow, &mut cx));
+        include.extend(any_of(&f.authors, "author", Step::Narrow, &mut cx));
+        let bytes = (f.size_mb.max(0.0) * 1024.0 * 1024.0).round() as i64;
+        match f.size_op {
+            SizeOp::Any => {}
+            SizeOp::LargerThan => include.push(format!("size>{bytes}")),
+            SizeOp::SmallerThan => include.push(format!("size<{bytes}")),
+        }
+        let sits: Vec<String> = non_empty(&f.sensitive)
+            .into_iter()
+            .map(|s| format!("SensitiveType:\"{s}\""))
+            .collect();
+        if !sits.is_empty() {
+            let files_only = self.item_types.is_empty()
+                || self
+                    .item_types
+                    .iter()
+                    .all(|t| t == "Files in OneDrive and SharePoint");
+            cx.push(
+                if files_only {
+                    Level::Info
+                } else {
+                    Level::Warning
+                },
+                Step::Narrow,
+                "Sensitive information can only be found in OneDrive and SharePoint files. \
+                 Emails and Teams messages won't match this filter.",
+            );
+        }
+        include.extend(group(&sits, "OR"));
+
+        // Assemble
         let negative = group(&exclude, "OR");
         let query = match (include.len(), negative) {
             (0, None) => String::new(),
@@ -978,7 +763,9 @@ impl QuerySpec {
             (0, Some(n)) => {
                 cx.push(
                     Level::Error,
-                    "The query only excludes things. Purview needs at least one positive condition before NOT (for example an item type or a date range).",
+                    Step::Words,
+                    "You've only said what to leave out. Add at least one thing to look for, such as \
+                     words, a date range or a type of item.",
                 );
                 format!("NOT {n}")
             }
@@ -988,249 +775,287 @@ impl QuerySpec {
 
         if query.is_empty() {
             cx.push(
-                Level::Info,
-                "Fill in any section on the left to start building a query.",
+                Level::Error,
+                Step::Words,
+                "There's nothing to search for yet. Add some words, a date range or a type of item.",
             );
-        } else if query.len() > LENGTH_WARNING {
-            cx.push(
-                Level::Warning,
-                format!(
-                    "The query is {} characters long; Purview may reject very long queries. Consider splitting it into several searches.",
-                    query.len()
-                ),
-            );
+        } else {
+            if non_empty(&k.words).is_empty() && k.near.is_empty() {
+                cx.push(
+                    Level::Info,
+                    Step::Words,
+                    "No words were added, so everything that matches your other choices will be found.",
+                );
+            }
+            if d.mode == DateMode::AnyTime {
+                cx.push(
+                    Level::Info,
+                    Step::When,
+                    "No dates were chosen, so every date will be searched. A date range makes results smaller and faster.",
+                );
+            }
+            if query.len() > LENGTH_LIMIT {
+                cx.push(
+                    Level::Warning,
+                    Step::Review,
+                    "This request is very long. Purview may refuse it for OneDrive and SharePoint; \
+                     try fewer words or split it into two requests.",
+                );
+            }
         }
 
         notices.sort_by_key(|n| n.level);
         Built { query, notices }
     }
 
-    fn build_keywords(&self, include: &mut Vec<String>, exclude: &mut Vec<String>, cx: &mut Ctx) {
+    /// Plain-English lines describing what will be searched for, grouped by step.
+    pub fn describe(&self, today: NaiveDate) -> Vec<(Step, Vec<String>)> {
+        let mut out = Vec::new();
+
+        let a = &self.about;
+        let mut about = vec![format!(
+            "Name: {}",
+            if a.name.trim().is_empty() {
+                "(not given)"
+            } else {
+                a.name.trim()
+            }
+        )];
+        if !a.reason.trim().is_empty() {
+            about.push(format!("Reason: {}", a.reason.trim()));
+        }
+        if let Some(n) = a.needed_by {
+            about.push(format!("Needed by {}", long_date(n)));
+        }
+        out.push((Step::About, about));
+
+        let c = &self.custodians;
+        let mut whose = Vec::new();
+        if c.everyone {
+            whose.push("Everyone in the organization".to_owned());
+        } else {
+            let p = non_empty(&c.people);
+            if !p.is_empty() {
+                whose.push(format!("People: {}", plain_list(&p, "and")));
+            }
+            let l = non_empty(&c.locations);
+            if !l.is_empty() {
+                whose.push(format!("Other places: {}", plain_list(&l, "and")));
+            }
+            if whose.is_empty() {
+                whose.push("Not given".to_owned());
+            }
+        }
+        out.push((Step::Whose, whose));
+
         let k = &self.keywords;
-        let prop = k.scope.property();
-
-        include.extend(terms(&k.all_words, prop, cx));
-        for phrase in split_phrases(&k.phrases) {
-            if let Some(t) = term(&format!("\"{phrase}\""), cx) {
-                include.push(scoped(prop, &t));
+        let place = match k.scope {
+            KeywordScope::Anywhere => "",
+            KeywordScope::SubjectTitle => " in the subject line or file title",
+        };
+        let mut words = Vec::new();
+        let w = non_empty(&k.words);
+        match (w.len(), k.match_all) {
+            (0, _) => {}
+            (1, _) => words.push(format!("Contains {}{place}", quoted_list(&w, "and"))),
+            (_, true) => words.push(format!("Contains all of {}{place}", quoted_list(&w, "and"))),
+            (_, false) => words.push(format!("Contains any of {}{place}", quoted_list(&w, "or"))),
+        }
+        for p in &k.near {
+            let (x, y) = (clean_entry(&p.first), clean_entry(&p.second));
+            if !x.is_empty() && !y.is_empty() {
+                words.push(format!(
+                    "Has \"{x}\" within {} words of \"{y}\"",
+                    p.distance.max(1)
+                ));
             }
         }
-        include.extend(group(&terms(&k.any_words, prop, cx), "OR"));
-        exclude.extend(terms(&k.none_words, prop, cx));
-    }
-
-    fn build_proximity(&self, include: &mut Vec<String>, cx: &mut Ctx) {
-        for p in &self.proximity {
-            match (term(&p.first, cx), term(&p.second, cx)) {
-                (Some(a), Some(b)) => {
-                    let op = if p.ordered { "ONEAR" } else { "NEAR" };
-                    include.push(format!("({a} {op}({}) {b})", p.distance.max(1)));
-                }
-                (None, None) => {}
-                _ => cx.push(
-                    Level::Warning,
-                    "A proximity search needs both words; it was skipped.",
-                ),
-            }
+        let none = non_empty(&k.none);
+        if !none.is_empty() {
+            words.push(format!(
+                "Leaves out anything containing {}",
+                quoted_list(&none, "or")
+            ));
         }
-    }
-
-    fn build_people(&self, include: &mut Vec<String>, exclude: &mut Vec<String>, cx: &mut Ctx) {
-        for p in &self.people {
-            if let Some(expr) = prop_any(p.field.property(), &split_list(&p.values), cx) {
-                if p.exclude {
-                    exclude.push(expr)
-                } else {
-                    include.push(expr)
-                }
-            }
+        if words.is_empty() {
+            words.push("No words (everything that matches the other choices)".to_owned());
         }
-    }
+        out.push((Step::Words, words));
 
-    fn build_dates(&self, include: &mut Vec<String>, today: NaiveDate, cx: &mut Ctx) {
-        for d in &self.dates {
-            let (start, end) = if d.op == DateOp::Between && d.start > d.end {
-                cx.push(
-                    Level::Info,
-                    "A date range had its start after its end; the dates were swapped.",
-                );
-                (d.end, d.start)
+        let d = &self.dates;
+        let when = match d.mode.range(d.start, d.end, today) {
+            None => "Any time".to_owned(),
+            Some((Some(x), Some(y))) => format!(
+                "{} between {} and {}",
+                d.field.verb(),
+                long_date(x),
+                long_date(y)
+            ),
+            Some((Some(x), None)) => format!("{} on or after {}", d.field.verb(), long_date(x)),
+            Some((None, Some(y))) => format!("{} on or before {}", d.field.verb(), long_date(y)),
+            Some((None, None)) => "Any time".to_owned(),
+        };
+        out.push((Step::When, vec![when]));
+
+        let types: Vec<&str> = ITEM_TYPES
+            .iter()
+            .filter(|t| self.item_types.iter().any(|l| l == t.label))
+            .map(|t| t.label)
+            .collect();
+        out.push((
+            Step::Types,
+            vec![if types.is_empty() {
+                "All types of items".to_owned()
             } else {
-                (d.start, d.end)
-            };
-            let restriction = match d.op {
-                DateOp::Between => format!(":{}..{}", date(start), date(end)),
-                DateOp::On => format!(":{}", date(start)),
-                DateOp::Before => format!("<{}", date(start)),
-                DateOp::OnOrBefore => format!("<={}", date(start)),
-                DateOp::After => format!(">{}", date(start)),
-                DateOp::OnOrAfter => format!(">={}", date(start)),
-                DateOp::LastNDays => {
-                    cx.push(
-                        Level::Info,
-                        "\"Last N days\" is turned into a fixed start date. Rebuild the query if you reuse it on a later day.",
-                    );
-                    format!(">={}", date(today - Duration::days(i64::from(d.days))))
-                }
-                DateOp::Relative => format!(":{}", d.relative.keyword()),
-            };
-            let parts: Vec<String> = d
-                .field
-                .properties()
-                .iter()
-                .map(|p| format!("{p}{restriction}"))
-                .collect();
-            include.extend(group(&parts, "OR"));
-        }
-    }
-
-    fn build_email(&self, include: &mut Vec<String>, cx: &mut Ctx) {
-        let e = &self.email;
-        match e.has_attachment {
-            Tri::Any => {}
-            Tri::Yes => include.push("HasAttachment:true".into()),
-            Tri::No => include.push("HasAttachment:false".into()),
-        }
-        match e.importance {
-            Importance::Any => {}
-            Importance::High => include.push("importance:high".into()),
-            Importance::Normal => include.push("importance:medium".into()),
-            Importance::Low => include.push("importance:low".into()),
-        }
-        match e.is_read {
-            Tri::Any => {}
-            Tri::Yes => include.push("IsRead:true".into()),
-            Tri::No => include.push("IsRead:false".into()),
-        }
-        include.extend(prop_any(
-            "AttachmentNames",
-            &split_list(&e.attachment_names),
-            cx,
+                plain_list(&types, "and")
+            }],
         ));
-        include.extend(prop_any("category", &split_list(&e.categories), cx));
-    }
 
-    fn build_docs(&self, include: &mut Vec<String>, cx: &mut Ctx) {
-        let d = &self.docs;
-        let mut exts: Vec<String> = d.extensions.clone();
-        for e in split_list(&d.custom_extensions.replace(' ', ",")) {
-            let e = e
-                .trim_start_matches("*.")
-                .trim_start_matches('.')
-                .to_lowercase();
-            if !e.is_empty() && !exts.contains(&e) {
-                exts.push(e);
+        let f = &self.filters;
+        let mut narrow = Vec::new();
+        for (values, label) in [(&f.sent_by, "Sent by"), (&f.sent_to, "Sent to")] {
+            let v = non_empty(values);
+            if !v.is_empty() {
+                narrow.push(format!("{label} {}", plain_list(&v, "or")));
             }
         }
-        include.extend(prop_any("FileExtension", &exts, cx));
-        include.extend(prop_any("FileName", &split_list(&d.file_names), cx));
-        include.extend(prop_any("path", &split_list(&d.paths), cx));
-    }
-
-    fn build_size(&self, include: &mut Vec<String>, cx: &mut Ctx) {
-        let s = &self.size;
-        let f = s.unit.factor();
-        let (a, b) = (s.a * f, s.b * f);
-        match s.op {
+        match f.attachments {
+            Attachments::Any => {}
+            Attachments::With => narrow.push("Has attachments".into()),
+            Attachments::Without => narrow.push("Has no attachments".into()),
+        }
+        let v = non_empty(&f.attachment_names);
+        if !v.is_empty() {
+            narrow.push(format!("Has an attachment named {}", quoted_list(&v, "or")));
+        }
+        if f.high_importance {
+            narrow.push("Marked high importance".into());
+        }
+        let mut ft: Vec<String> = f.file_types.clone();
+        ft.extend(
+            non_empty(&f.other_extensions)
+                .iter()
+                .map(|e| format!(".{}", e.trim_start_matches('.'))),
+        );
+        if !ft.is_empty() {
+            narrow.push(format!("File type is {}", plain_list(&ft, "or")));
+        }
+        for (values, label) in [
+            (&f.file_names, "File name is"),
+            (&f.authors, "File written by"),
+        ] {
+            let v = non_empty(values);
+            if !v.is_empty() {
+                narrow.push(format!("{label} {}", quoted_list(&v, "or")));
+            }
+        }
+        match f.size_op {
             SizeOp::Any => {}
-            SizeOp::LessThan => include.push(format!("size<{}", number(a))),
-            SizeOp::GreaterThan => include.push(format!("size>{}", number(a))),
-            SizeOp::Between => {
-                if a > b {
-                    cx.push(
-                        Level::Info,
-                        "The size range was reversed; the values were swapped.",
-                    );
-                }
-                let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-                include.push(format!("size:{}..{}", number(lo), number(hi)));
-            }
+            SizeOp::LargerThan => narrow.push(format!("Larger than {} MB", f.size_mb)),
+            SizeOp::SmallerThan => narrow.push(format!("Smaller than {} MB", f.size_mb)),
         }
+        let s: Vec<&str> = f
+            .sensitive
+            .iter()
+            .map(|n| {
+                SENSITIVE_TYPES
+                    .iter()
+                    .find(|(p, _)| p == n)
+                    .map_or(n.as_str(), |(_, l)| *l)
+            })
+            .collect();
+        if !s.is_empty() {
+            narrow.push(format!("Contains {}", plain_list(&s, "or").to_lowercase()));
+        }
+        let ex = non_empty(&f.leave_out_people);
+        if !ex.is_empty() {
+            narrow.push(format!(
+                "Leaves out anything sent by or to {}",
+                plain_list(&ex, "or")
+            ));
+        }
+        if narrow.is_empty() {
+            narrow.push("No extra filters".to_owned());
+        }
+        out.push((Step::Narrow, narrow));
+        out
     }
 
-    fn build_sensitive(&self, include: &mut Vec<String>, cx: &mut Ctx) {
-        let mut parts = Vec::new();
-        for s in &self.sensitive {
-            let name = s.name.trim().replace('"', "");
-            if name.is_empty() {
-                continue;
-            }
-            let value = if s.min_count <= 1 && s.confidence == Confidence::Any {
-                name
-            } else {
-                let conf = s.confidence.min().unwrap_or(1);
-                format!("{name}|{}..|{conf}..100", s.min_count.max(1))
-            };
-            parts.push(format!("SensitiveType:\"{value}\""));
-        }
-        if !parts.is_empty() {
-            cx.push(
-                Level::Info,
-                "SensitiveType only matches items that Purview classified when it indexed them (mainly Exchange email and SharePoint/OneDrive files).",
-            );
-        }
-        include.extend(group(&parts, "OR"));
+    /// File name for the saved request, e.g. `Smith records request 2026-10-23.kql`.
+    pub fn file_name(&self, today: NaiveDate) -> String {
+        let safe: String = self
+            .about
+            .name
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' {
+                    c
+                } else {
+                    ' '
+                }
+            })
+            .collect();
+        let safe = safe.split_whitespace().collect::<Vec<_>>().join(" ");
+        let base = if safe.is_empty() {
+            "Search request".to_owned()
+        } else {
+            safe
+        };
+        format!("{base} {}.kql", iso(today))
     }
 
-    fn build_advanced(&self, include: &mut Vec<String>, cx: &mut Ctx) {
-        let mut expr: Option<String> = None;
-        for c in &self.advanced {
-            let prop = c.property.trim();
-            if prop.is_empty() {
-                continue;
-            }
-            if prop
-                .chars()
-                .any(|ch| ch.is_whitespace() || "():\"<>=".contains(ch))
-            {
-                cx.push(
-                    Level::Error,
-                    format!("Property name '{prop}' contains spaces or symbols; it was skipped."),
-                );
-                continue;
-            }
-            let Some(v) = term(&c.value, cx) else {
-                continue;
+    /// Subject and body for the email that goes with the file.
+    pub fn email(&self, file_name: &str, today: NaiveDate) -> (String, String) {
+        let name = self.about.name.trim();
+        let subject = format!("eDiscovery search request: {name}");
+        let mut body = String::from("Hello,\n\nPlease run the attached Purview search");
+        body.push_str(&format!(" ({file_name}).\n"));
+        for (step, lines) in self.describe(today) {
+            let heading = match step {
+                Step::About => "Request",
+                Step::Whose => "Whose content to search",
+                Step::Words => "Words",
+                Step::When => "Dates",
+                Step::Types => "Types of items",
+                Step::Narrow => "Other filters",
+                Step::Review => continue,
             };
-            let restriction = if c.op == CondOp::Range {
-                let Some(v2) = term(&c.value2, cx) else {
-                    cx.push(
-                        Level::Warning,
-                        format!("The range on '{prop}' needs two values; it was skipped."),
-                    );
-                    continue;
-                };
-                format!("{prop}:{v}..{v2}")
-            } else {
-                format!("{prop}{}{v}", c.op.token())
-            };
-            expr = Some(match expr {
-                None => {
-                    if c.join == Join::AndNot {
-                        cx.push(
-                            Level::Warning,
-                            "The first advanced condition can't start with AND NOT; it was treated as AND.",
-                        );
-                    }
-                    restriction
-                }
-                Some(prev) => {
-                    // Wrap what came before so the conditions read strictly top to bottom.
-                    let prev = if prev.contains(' ') {
-                        format!("({prev})")
-                    } else {
-                        prev
-                    };
-                    match c.join {
-                        Join::And => format!("{prev} AND {restriction}"),
-                        Join::Or => format!("{prev} OR {restriction}"),
-                        Join::AndNot => format!("{prev} NOT {restriction}"),
-                    }
-                }
-            });
+            body.push_str(&format!("\n{heading}:\n"));
+            for l in lines {
+                body.push_str(&format!("  - {l}\n"));
+            }
         }
-        if let Some(e) = expr {
-            include.push(if e.contains(' ') { format!("({e})") } else { e });
+        body.push_str("\nThank you.\n");
+        (subject, body)
+    }
+
+    /// A filled-in sample request.
+    pub fn example(today: NaiveDate) -> Self {
+        Self {
+            about: About {
+                name: "Example - Highway 56 contract".into(),
+                reason: "Data practices request from a resident".into(),
+                needed_by: Some(today + Duration::days(10)),
+            },
+            custodians: Custodians {
+                people: vec!["jane.doe@example.gov".into(), "pat.lee@example.gov".into()],
+                ..Default::default()
+            },
+            keywords: Keywords {
+                words: vec!["Highway 56".into(), "contract".into()],
+                match_all: true,
+                none: vec!["newsletter".into()],
+                ..Default::default()
+            },
+            dates: Dates {
+                mode: DateMode::ThisYear,
+                ..Dates::new(today)
+            },
+            item_types: vec!["Email".into(), "Files in OneDrive and SharePoint".into()],
+            filters: Filters {
+                attachments: Attachments::With,
+                ..Default::default()
+            },
         }
     }
 }
@@ -1248,243 +1073,273 @@ mod tests {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
     }
 
-    fn build(spec: &QuerySpec) -> Built {
-        spec.build_at(d(2026, 10, 23))
+    const TODAY: (i32, u32, u32) = (2026, 10, 23);
+
+    fn today() -> NaiveDate {
+        d(TODAY.0, TODAY.1, TODAY.2)
+    }
+
+    fn named() -> SearchRequest {
+        let mut s = SearchRequest::default();
+        s.about.name = "Test".into();
+        s.custodians.everyone = true;
+        s.dates = Dates::new(today());
+        s
+    }
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    fn errors(b: &Built) -> Vec<&str> {
+        b.notices
+            .iter()
+            .filter(|n| n.level == Level::Error)
+            .map(|n| n.message.as_str())
+            .collect()
     }
 
     #[test]
-    fn empty_spec_gives_empty_query() {
-        let b = build(&QuerySpec::default());
+    fn empty_request_cannot_be_saved() {
+        let b = SearchRequest::default().build_at(today());
         assert_eq!(b.query, "");
-        assert!(b.notices.iter().all(|n| n.level == Level::Info));
-    }
-
-    #[test]
-    fn tokenize_keeps_phrases() {
-        assert_eq!(
-            tokenize(r#"budget "fiscal year" 2026"#),
-            vec!["budget", "\"fiscal year\"", "2026"]
-        );
-        assert_eq!(tokenize(r#"open "quote"#), vec!["open", "\"quote\""]);
-        assert_eq!(tokenize(r#"a "" b"#), vec!["a", "b"]);
-    }
-
-    #[test]
-    fn keywords_all_any_none() {
-        let mut s = QuerySpec::default();
-        s.keywords.all_words = "budget audit".into();
-        s.keywords.phrases = "fiscal year; \"county board\"".into();
-        s.keywords.any_words = "draft final".into();
-        s.keywords.none_words = "newsletter spam".into();
-        assert_eq!(
-            build(&s).query,
-            r#"(budget AND audit AND "fiscal year" AND "county board" AND (draft OR final)) NOT (newsletter OR spam)"#
-        );
-    }
-
-    #[test]
-    fn keyword_scope_and_reserved_words() {
-        let mut s = QuerySpec::default();
-        s.keywords.all_words = "NEAR merger".into();
-        s.keywords.scope = KeywordScope::Subject;
-        assert_eq!(build(&s).query, r#"subject:"NEAR" AND subject:merger"#);
-    }
-
-    #[test]
-    fn prefix_wildcard_warns() {
-        let mut s = QuerySpec::default();
-        s.keywords.all_words = "*port budg*".into();
-        let b = build(&s);
-        assert_eq!(b.query, "*port AND budg*");
+        assert!(!b.can_save());
+        assert_eq!(errors(&b).len(), 2, "{:?}", b.notices);
         assert!(
             b.notices
                 .iter()
-                .any(|n| n.level == Level::Warning && n.message.contains("suffix"))
+                .any(|n| n.step == Step::Whose && n.level == Level::Warning)
         );
     }
 
     #[test]
-    fn proximity() {
-        let mut s = QuerySpec::default();
-        s.proximity.push(Proximity {
+    fn words_any_and_all() {
+        let mut s = named();
+        s.keywords.words = v(&["budget", "fiscal year", "\"county board\""]);
+        assert_eq!(
+            s.build_at(today()).query,
+            r#"(budget OR "fiscal year" OR "county board")"#
+        );
+        s.keywords.match_all = true;
+        s.keywords.none = v(&["newsletter", "spam"]);
+        let b = s.build_at(today());
+        assert_eq!(
+            b.query,
+            r#"(budget AND "fiscal year" AND "county board") NOT (newsletter OR spam)"#
+        );
+        assert!(b.can_save());
+    }
+
+    #[test]
+    fn subject_scope_and_reserved_words() {
+        let mut s = named();
+        s.keywords.words = v(&["NEAR", "merger"]);
+        s.keywords.match_all = true;
+        s.keywords.scope = KeywordScope::SubjectTitle;
+        assert_eq!(
+            s.build_at(today()).query,
+            r#"SubjectTitle:"NEAR" AND SubjectTitle:merger"#
+        );
+    }
+
+    #[test]
+    fn leading_wildcard_warns() {
+        let mut s = named();
+        s.keywords.words = v(&["*port"]);
+        let b = s.build_at(today());
+        assert!(
+            b.notices
+                .iter()
+                .any(|n| n.level == Level::Warning && n.step == Step::Words)
+        );
+    }
+
+    #[test]
+    fn near_needs_both_words() {
+        let mut s = named();
+        s.keywords.near.push(Near {
             first: "contract".into(),
             second: "breach".into(),
             distance: 5,
-            ordered: false,
         });
-        s.proximity.push(Proximity {
-            first: "jury".into(),
-            second: "verdict".into(),
-            distance: 3,
-            ordered: true,
+        assert_eq!(s.build_at(today()).query, "(contract NEAR(5) breach)");
+        s.keywords.near.push(Near {
+            first: "late".into(),
+            ..Default::default()
         });
-        assert_eq!(
-            build(&s).query,
-            "(contract NEAR(5) breach) AND (jury ONEAR(3) verdict)"
-        );
+        assert!(!s.build_at(today()).can_save());
     }
 
     #[test]
-    fn kinds_and_people() {
-        let mut s = QuerySpec::default();
-        s.kinds = vec!["email".into(), "microsoftteams".into()];
-        s.people.push(PersonCond {
-            field: PersonField::From,
-            values: "alice@contoso.com; Bob Smith".into(),
-            exclude: false,
-        });
-        s.people.push(PersonCond {
-            field: PersonField::Participants,
-            values: "noreply@contoso.com".into(),
-            exclude: true,
-        });
-        assert_eq!(
-            build(&s).query,
-            r#"((kind:email OR kind:microsoftteams) AND (from:alice@contoso.com OR from:"Bob Smith")) NOT participants:noreply@contoso.com"#
-        );
+    fn only_exclusions_is_an_error() {
+        let mut s = named();
+        s.keywords.none = v(&["spam"]);
+        let b = s.build_at(today());
+        assert_eq!(b.query, "NOT spam");
+        assert!(!b.can_save());
     }
 
     #[test]
-    fn dates() {
-        let mut s = QuerySpec::default();
-        s.dates.push(DateCond {
-            field: DateField::Sent,
-            op: DateOp::Between,
-            start: d(2026, 3, 31),
-            end: d(2026, 1, 1),
-            ..DateCond::new(d(2026, 10, 23))
-        });
-        let b = build(&s);
+    fn date_choices_become_fixed_dates() {
+        let mut s = named();
+        let q = |s: &SearchRequest| s.build_at(today()).query;
+        s.dates.field = DateField::Sent;
+        s.dates.mode = DateMode::Last30Days;
+        assert_eq!(q(&s), "sent:2026-09-23..2026-10-23");
+        s.dates.mode = DateMode::Last12Months;
+        assert_eq!(q(&s), "sent:2025-10-23..2026-10-23");
+        s.dates.mode = DateMode::ThisYear;
+        assert_eq!(q(&s), "sent:2026-01-01..2026-10-23");
+        s.dates.mode = DateMode::LastYear;
+        assert_eq!(q(&s), "sent:2025-01-01..2025-12-31");
+        s.dates.mode = DateMode::Between;
+        s.dates.start = d(2026, 3, 31);
+        s.dates.end = d(2026, 1, 1);
+        let b = s.build_at(today());
         assert_eq!(b.query, "sent:2026-01-01..2026-03-31");
         assert!(b.notices.iter().any(|n| n.message.contains("swapped")));
-
-        s.dates[0].field = DateField::AnyItemDate;
-        s.dates[0].op = DateOp::LastNDays;
-        s.dates[0].days = 7;
+        s.dates.field = DateField::Any;
+        s.dates.mode = DateMode::OnOrAfter;
+        s.dates.start = d(2026, 10, 1);
         assert_eq!(
-            build(&s).query,
-            "(sent>=2026-10-16 OR received>=2026-10-16 OR LastModifiedTime>=2026-10-16)"
+            q(&s),
+            "(sent>=2026-10-01 OR received>=2026-10-01 OR LastModifiedTime>=2026-10-01)"
         );
-
-        s.dates[0].field = DateField::Created;
-        s.dates[0].op = DateOp::Relative;
-        s.dates[0].relative = RelativeDate::LastMonth;
-        assert_eq!(build(&s).query, r#"Created:"last month""#);
-    }
-
-    #[test]
-    fn email_docs_size() {
-        let mut s = QuerySpec::default();
-        s.email.has_attachment = Tri::Yes;
-        s.email.importance = Importance::Normal;
-        s.docs.extensions = vec!["pdf".into()];
-        s.docs.custom_extensions = ".DWG, *.xlsm pdf".into();
-        s.size = SizeCond {
-            op: SizeOp::GreaterThan,
-            a: 2.0,
-            b: 0.0,
-            unit: SizeUnit::MB,
-        };
-        assert_eq!(
-            build(&s).query,
-            "HasAttachment:true AND importance:medium AND (FileExtension:pdf OR FileExtension:dwg OR FileExtension:xlsm) AND size>2097152"
+        s.dates.field = DateField::Created;
+        s.dates.mode = DateMode::OnOrBefore;
+        assert_eq!(q(&s), "Created<=2026-01-01");
+        s.dates.mode = DateMode::OnOrAfter;
+        s.dates.start = d(2027, 1, 1);
+        assert!(
+            s.build_at(today())
+                .notices
+                .iter()
+                .any(|n| n.message.contains("future"))
         );
     }
 
     #[test]
-    fn sensitive_types() {
-        let mut s = QuerySpec::default();
-        s.sensitive.push(SensitiveCond {
-            name: "Credit Card Number".into(),
-            min_count: 1,
-            confidence: Confidence::Any,
-        });
-        s.sensitive.push(SensitiveCond {
-            name: "U.S. Social Security Number (SSN)".into(),
-            min_count: 5,
-            confidence: Confidence::High,
-        });
-        assert_eq!(
-            build(&s).query,
-            r#"(SensitiveType:"Credit Card Number" OR SensitiveType:"U.S. Social Security Number (SSN)|5..|85..100")"#
-        );
-    }
-
-    #[test]
-    fn advanced_conditions_fold_top_to_bottom() {
-        let mut s = QuerySpec::default();
-        s.advanced.push(Condition {
-            property: "subject".into(),
-            value: "invoice".into(),
-            ..Default::default()
-        });
-        s.advanced.push(Condition {
-            join: Join::Or,
-            property: "AttachmentNames".into(),
-            value: "invoice*".into(),
-            ..Default::default()
-        });
-        s.advanced.push(Condition {
-            join: Join::AndNot,
-            property: "from".into(),
-            value: "billing@contoso.com".into(),
-            ..Default::default()
-        });
-        s.advanced.push(Condition {
-            join: Join::And,
-            property: "size".into(),
-            op: CondOp::Range,
-            value: "1000".into(),
-            value2: "5000".into(),
-        });
-        assert_eq!(
-            build(&s).query,
-            "(((subject:invoice OR AttachmentNames:invoice*) NOT from:billing@contoso.com) AND size:1000..5000)"
-        );
-    }
-
-    #[test]
-    fn exclusions_only_is_an_error() {
-        let mut s = QuerySpec::default();
-        s.keywords.none_words = "spam".into();
-        let b = build(&s);
-        assert_eq!(b.query, "NOT spam");
-        assert_eq!(b.notices[0].level, Level::Error);
-    }
-
-    #[test]
-    fn raw_is_checked() {
-        let mut s = QuerySpec::default();
-        s.kinds = vec!["email".into()];
-        s.raw = "(budget or \"audit".into();
-        let b = build(&s);
-        assert_eq!(b.query, "kind:email AND ((budget or \"audit)");
-        assert_eq!(
-            b.notices.iter().filter(|n| n.level == Level::Error).count(),
-            2
-        );
-        assert!(b.notices.iter().any(|n| n.message.contains("upper case")));
-    }
-
-    #[test]
-    fn example_is_clean() {
-        let b = build(&QuerySpec::example(d(2026, 10, 23)));
+    fn types_and_people_filters() {
+        let mut s = named();
+        s.item_types = v(&["Email", "Teams chats and meetings"]);
+        s.filters.sent_by = v(&["alice@example.gov", "Bob Smith"]);
+        s.filters.leave_out_people = v(&["noreply@example.gov"]);
+        let b = s.build_at(today());
         assert_eq!(
             b.query,
-            "(contract AND \"purchase agreement\" AND (draft OR revised OR final) AND (payment NEAR(5) late) \
-             AND (kind:email OR kind:docs) AND (participants:jane.doe@contoso.com OR participants:fabrikam.com) \
-             AND (sent:2026-01-01..2026-10-23 OR received:2026-01-01..2026-10-23 OR LastModifiedTime:2026-01-01..2026-10-23) \
-             AND HasAttachment:true AND (FileExtension:docx OR FileExtension:pdf)) NOT newsletter"
+            r#"((kind:email OR kind:microsoftteams OR kind:im) AND (from:alice@example.gov OR from:"Bob Smith")) NOT participants:noreply@example.gov"#
         );
-        assert!(b.notices.iter().all(|n| n.level == Level::Info));
+        assert!(
+            b.notices
+                .iter()
+                .any(|n| n.level == Level::Warning && n.message.contains("Bob Smith"))
+        );
     }
 
     #[test]
-    fn embedded_quotes_are_stripped() {
-        let mut s = QuerySpec::default();
-        s.email.attachment_names = r#"my "final" report.docx"#.into();
-        let b = build(&s);
-        assert_eq!(b.query, r#"AttachmentNames:"my final report.docx""#);
-        assert!(b.notices.iter().any(|n| n.level == Level::Warning));
+    fn address_check() {
+        assert!(looks_like_address("jane@example.gov"));
+        assert!(looks_like_address("example.gov"));
+        assert!(!looks_like_address("Jane Doe"));
+        assert!(!looks_like_address("jane@"));
+        assert!(!looks_like_address("jane@localhost"));
+    }
+
+    #[test]
+    fn missing_custodians_warns_but_saves() {
+        let mut s = named();
+        s.custodians.everyone = false;
+        s.keywords.words = v(&["budget"]);
+        let b = s.build_at(today());
+        assert!(b.can_save());
+        assert!(
+            b.notices
+                .iter()
+                .any(|n| n.step == Step::Whose && n.level == Level::Warning)
+        );
+    }
+
+    #[test]
+    fn filters() {
+        let mut s = named();
+        s.filters.attachments = Attachments::With;
+        s.filters.high_importance = true;
+        s.filters.file_types = v(&["PDF", "Word"]);
+        s.filters.other_extensions = v(&[".DWG", "pdf"]);
+        s.filters.size_op = SizeOp::LargerThan;
+        s.filters.size_mb = 2.0;
+        s.filters.sensitive = v(&["Credit Card Number"]);
+        let b = s.build_at(today());
+        assert_eq!(
+            b.query,
+            "HasAttachment:true AND importance:high \
+             AND (FileExtension:docx OR FileExtension:doc OR FileExtension:pdf OR FileExtension:dwg) \
+             AND size>2097152 AND SensitiveType:\"Credit Card Number\""
+        );
+        assert!(
+            b.notices
+                .iter()
+                .any(|n| n.level == Level::Info && n.message.contains("OneDrive"))
+        );
+        s.item_types = v(&["Email"]);
+        assert!(
+            s.build_at(today())
+                .notices
+                .iter()
+                .any(|n| n.level == Level::Warning && n.message.contains("OneDrive"))
+        );
+    }
+
+    #[test]
+    fn embedded_quotes_are_removed() {
+        let mut s = named();
+        s.filters.attachment_names = v(&[r#"my "final" report.docx"#]);
+        assert_eq!(
+            s.build_at(today()).query,
+            r#"AttachmentNames:"my final report.docx""#
+        );
+    }
+
+    #[test]
+    fn example_builds_describes_and_emails() {
+        let s = SearchRequest::example(today());
+        let b = s.build_at(today());
+        assert_eq!(
+            b.query,
+            "(\"Highway 56\" AND contract \
+             AND (sent:2026-01-01..2026-10-23 OR received:2026-01-01..2026-10-23 OR LastModifiedTime:2026-01-01..2026-10-23) \
+             AND (kind:email OR kind:docs) AND HasAttachment:true) NOT newsletter"
+        );
+        assert!(b.can_save(), "{:?}", b.notices);
+        let described = s.describe(today());
+        assert_eq!(
+            described[2].1,
+            vec![
+                "Contains all of \"Highway 56\" and \"contract\"",
+                "Leaves out anything containing \"newsletter\"",
+            ]
+        );
+        assert_eq!(
+            described[3].1,
+            vec!["Dated between January 1, 2026 and October 23, 2026"]
+        );
+        let (subject, body) = s.email("x.kql", today());
+        assert_eq!(
+            subject,
+            "eDiscovery search request: Example - Highway 56 contract"
+        );
+        assert!(body.contains(
+            "Whose content to search:\n  - People: jane.doe@example.gov and pat.lee@example.gov"
+        ));
+        assert!(body.contains("(x.kql)"));
+    }
+
+    #[test]
+    fn file_name_is_safe() {
+        let mut s = named();
+        s.about.name = "Smith / Jones: records?".into();
+        assert_eq!(s.file_name(today()), "Smith Jones records 2026-10-23.kql");
+        s.about.name = "  ".into();
+        assert_eq!(s.file_name(today()), "Search request 2026-10-23.kql");
     }
 }

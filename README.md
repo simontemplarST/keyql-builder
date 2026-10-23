@@ -1,38 +1,81 @@
-# Purview KeyQL Builder
+# eDiscovery Search Request
 
-A desktop form for building Microsoft Purview eDiscovery **KeyQL** queries without
-memorising the syntax. You fill in text boxes, check boxes, dropdowns and date
-pickers, and the app writes the query live, ready to paste into
+A desktop app that helps staff ask for a Microsoft Purview eDiscovery search without
+knowing any search syntax. They answer a few plain-language questions, and the app
+saves a **`.kql` file** to email to the IT Director, who pastes it into
 Purview → eDiscovery → Search → Query → KeyQL editor.
 
-Built in Rust with [egui/eframe](https://github.com/emilk/egui).
+Staff never see the query. They see a plain-English summary of what they asked for.
 
-## What you can build
+Built in Rust with [egui/eframe](https://github.com/emilk/egui). It runs on Windows,
+macOS and Linux.
 
-| Section | Controls | Example output |
-|---|---|---|
-| Keywords | all / exact phrases / any / none of these words, plus where to look (anywhere, subject/title, subject, title) | `budget AND "fiscal year" AND (draft OR final) … NOT newsletter` |
-| Words near each other | two words, distance, "in this order" | `(payment NEAR(5) late)`, `(jury ONEAR(3) verdict)` |
-| Item types | check boxes for every `kind:` value | `(kind:email OR kind:microsoftteams)` |
-| People | from / to / cc / bcc / participants / recipients / author / modified by; include or exclude | `(from:jane@contoso.com OR from:"John Smith")` |
-| Dates | sent, received, created, modified or any item date; between / on / before / after / last N days / relative (this week, last month…) with calendar pickers | `sent:2026-01-01..2026-03-31`, `Created:"last month"` |
-| Email details | has attachments, importance, read state, attachment names, categories | `HasAttachment:true AND importance:high` |
-| Documents & files | file-type check boxes, other extensions, file names, site/folder URL | `(FileExtension:docx OR FileExtension:pdf)` |
-| Size | smaller / larger / between, in bytes–GB | `size>2097152` |
-| Sensitive information | built-in or custom SIT name, minimum count, confidence | `SensitiveType:"Credit Card Number\|3..\|85..100"` |
-| Advanced conditions | any property × operator (`:` `=` `<>` `<` `<=` `>` `>=` `..`), joined AND / OR / AND NOT, read top to bottom | `((subject:invoice OR AttachmentNames:invoice*) NOT from:billing@contoso.com)` |
-| Custom KeyQL | free text, ANDed on as-is | |
+## How it works
 
-Sections are combined with `AND`; every exclusion is gathered into one trailing `NOT (…)`.
+The app is a seven-step wizard with a step list on the left. Everything except the
+request name is optional, and you can jump to any step at any time.
 
-The **Checks** panel flags problems as you type: unbalanced quotes or parentheses,
-lower-case `and`/`or`/`not` (Purview treats those as search words), leading
-wildcards (Purview only supports suffix `*`), queries that only exclude things,
-reversed ranges, and very long queries.
+| Step | What staff do |
+|---|---|
+| 1. About this request | Name the request (required). Optionally add a reason and a deadline. |
+| 2. Whose content | List the people (work email addresses) or shared mailboxes and sites to search, or tick "Search everyone". |
+| 3. Words to look for | Add words or phrases as chips, then choose "any of these" or "all of these" and where they should appear. Optional: words to leave out, and words close together. |
+| 4. Dates | Pick Any time, Last 30 days, Last 12 months, This year, Last year, or custom dates. Dates can be typed (MM/DD/YYYY) or picked from a calendar. |
+| 5. Types of items | Tick cards for Email, Teams chats and meetings, or Files in OneDrive and SharePoint. More types are listed below. |
+| 6. Narrow it down | Optional filters: sender and recipients, attachments, file types and names, authors, importance, size, and sensitive information. |
+| 7. Check and save | Read a plain-English summary with **Change** links, see any problems with links to fix them, then **Save request file…**. |
 
-**Saved queries** keeps named forms between sessions, and **Example** fills in a
-sample. Everything you enter is stored locally by eframe (`~/.local/share/keyql-builder/`
-on Linux, `%APPDATA%\keyql-builder\` on Windows).
+After saving, a confirmation page says what to do next and offers three buttons:
+
+- **Write the email** opens your mail program with the To, Subject and body filled in. You still attach the file yourself.
+- **Copy email text** copies the request details: name, reason, deadline, whose content to search, and the summary.
+- **Show the file in its folder** opens the folder the file was saved to.
+
+The people and places to search go in the email, not the file. Purview chooses them
+separately from the query, and KeyQL has no comments.
+
+**Settings:** the IT Director's email address (used for the To line), text size
+(Standard, Large or Extra large) and colors (match my computer, light or dark).
+
+Answers are saved automatically and are still there when the app is reopened.
+
+## Design basis
+
+The layout follows published form-usability guidance:
+
+- **NN/g** on wizards, required fields, placeholders and toggles vs. checkboxes
+- **GOV.UK Design System**: one thing per page, check answers, error summary and error messages
+- **USWDS**: date inputs and date ranges
+- **WCAG 2.2**: contrast, not relying on color alone, and keyboard use
+
+In practice that means:
+
+- Labels and hints sit above the fields, and examples stay visible.
+- Optional sections stay collapsed until needed.
+- Problems show up once you've moved on from a step, both on the step itself and in a summary on the review page.
+- Every problem has an icon and text, so color is never the only signal.
+- Hint text has at least 7:1 contrast and field borders at least 3:1, in both themes.
+- Anything still typed in a box is kept when you change page.
+
+## The query
+
+`src/query.rs` turns the answers into KeyQL. It follows the syntax on Microsoft Learn
+("Keyword queries and search conditions for eDiscovery"):
+
+- Operators are always written in upper case (`AND`, `OR`, `NOT`, `NEAR(n)`).
+- Phrases are quoted.
+- Dates are absolute (`sent:2026-01-01..2026-03-31`). Choices like "Last 30 days" are fixed on the day the file is saved, so the search can be repeated exactly.
+- Several values in one condition are joined with `OR`, and conditions are joined with `AND`. Everything to leave out is gathered into one trailing `NOT (…)`.
+- Item types map to `kind:` (email, microsoftteams/im, docs, meetings…). People map to `from:`, `recipients:` and `participants:`. Filters map to `HasAttachment:`, `FileExtension:`, `FileName:`, `author:`, `importance:`, `size>` / `size<` and `SensitiveType:"…"`.
+
+The checks stop saving when there's nothing to search for, when only exclusions were
+given, when the request has no name, or when a date can't be read. They warn about:
+
+- names instead of email addresses
+- a `*` at the start of a word
+- dates in the future
+- sensitive-information filters on email (they only work on OneDrive and SharePoint)
+- queries over Purview's 4,000-character limit
 
 ## Build and run
 
@@ -40,22 +83,15 @@ Requires a Rust toolchain (<https://rustup.rs>).
 
 ```sh
 cargo run --release              # start the app
-cargo run --release -- --example # start with the sample query loaded
-cargo test                       # query-generator unit tests
+cargo run --release -- --example # start on the review page with a sample request
+cargo test                       # query generator and UI helper tests
 ```
 
-Builds natively on Linux, Windows and macOS. On Windows, the release build
-opens no console window.
+On Windows the release build opens no console window. Saved answers live in
+`~/.local/share/keyql-builder/` on Linux and `%APPDATA%\keyql-builder\` on Windows.
 
 ## Layout
 
-- `src/query.rs` holds the query model and KeyQL generator. It is pure and unit tested.
-- `src/app.rs` holds the egui form, output panel and saved queries.
+- `src/query.rs` holds the request model, the KeyQL generator, the plain-English summary, the email text and the checks. It is pure and unit tested.
+- `src/app.rs` holds the wizard UI, the chip and date inputs, saving and settings.
 - `src/main.rs` sets up the window.
-
-## Caveats
-
-KeyQL support differs between Purview data sources. In particular, `SensitiveType`
-only matches content that was classified at index time, and some properties apply
-only to email or only to documents. Check results in Purview's statistics or
-sample view before relying on a query.
