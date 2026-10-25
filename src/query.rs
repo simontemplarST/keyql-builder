@@ -1,7 +1,7 @@
 //! Search request model and KeyQL generator for Microsoft Purview eDiscovery.
 //!
 //! Staff fill in a `SearchRequest` through the wizard. `SearchRequest::build`
-//! turns it into one KeyQL string, which is written to a `.kql` file for the
+//! turns it into one KeyQL string, which is saved in a `.req` file for the
 //! IT Director, plus plain-language notices. `describe` and `email` give
 //! the plain-English versions shown on the review screen and sent with the
 //! file. Everything here is pure and unit tested.
@@ -823,6 +823,19 @@ fn iso(d: NaiveDate) -> String {
     d.format("%Y-%m-%d").to_string()
 }
 
+/// The heading for one part of the summary in the email, the records copy and the request file.
+pub fn section_title(step: Step) -> Option<&'static str> {
+    Some(match step {
+        Step::About => "Request",
+        Step::Whose => "Whose content to search",
+        Step::Words => "Words",
+        Step::When => "Dates",
+        Step::Types => "Types of items",
+        Step::Narrow => "Other filters",
+        Step::Review => return None,
+    })
+}
+
 /// "March 5, 2026"
 pub fn long_date(d: NaiveDate) -> String {
     d.format("%B %-d, %Y").to_string()
@@ -1310,7 +1323,7 @@ impl SearchRequest {
         out
     }
 
-    /// File name for the saved request, e.g. `Smith records request 2026-10-23.kql`.
+    /// File name for the saved request, e.g. `Smith records request 2026-10-23.req`.
     /// The request's name, or "<kind> <date>" when none was given.
     pub fn display_name(&self, today: NaiveDate) -> String {
         let name = self.about.name.trim();
@@ -1340,23 +1353,29 @@ impl SearchRequest {
         } else {
             safe
         };
-        format!("{base} {}.kql", iso(today))
+        format!("{base} {}.req", iso(today))
     }
 
     /// Subject and body for the email that goes with the file.
-    pub fn email(&self, file_name: &str, today: NaiveDate) -> (String, String) {
+    /// The email to the IT Director. `app_url` is where the app can be opened, when it runs on the web.
+    pub fn email(
+        &self,
+        file_name: &str,
+        app_url: Option<&str>,
+        today: NaiveDate,
+    ) -> (String, String) {
         let subject = format!("eDiscovery search request: {}", self.display_name(today));
-        let mut body = String::from("Hello,\n\nPlease run the attached Purview search");
-        body.push_str(&format!(" ({file_name}).\n"));
+        let mut body = format!(
+            "Hello,\n\nPlease run the Purview search in the attached request file ({file_name}).\n\
+             Open it in the eDiscovery Search Request app with \"Open a request file\" to see the \
+             details and copy the KeyQL query.\n"
+        );
+        if let Some(url) = app_url {
+            body.push_str(&format!("The app: {url}\n"));
+        }
         for (step, lines) in self.describe(today) {
-            let heading = match step {
-                Step::About => "Request",
-                Step::Whose => "Whose content to search",
-                Step::Words => "Words",
-                Step::When => "Dates",
-                Step::Types => "Types of items",
-                Step::Narrow => "Other filters",
-                Step::Review => continue,
+            let Some(heading) = section_title(step) else {
+                continue;
             };
             body.push_str(&format!("\n{heading}:\n"));
             for l in lines {
@@ -1376,14 +1395,8 @@ impl SearchRequest {
             long_date(today)
         );
         for (step, lines) in self.describe(today) {
-            let heading = match step {
-                Step::About => "Request",
-                Step::Whose => "Whose content to search",
-                Step::Words => "Words",
-                Step::When => "Dates",
-                Step::Types => "Types of items",
-                Step::Narrow => "Other filters",
-                Step::Review => continue,
+            let Some(heading) = section_title(step) else {
+                continue;
             };
             out.push_str(&format!("\n{heading}:\n"));
             for l in lines {
@@ -1698,7 +1711,7 @@ mod tests {
             described[3].1,
             vec!["Dated between January 1, 2026 and October 23, 2026"]
         );
-        let (subject, body) = s.email("x.kql", today());
+        let (subject, body) = s.email("x.req", None, today());
         assert_eq!(
             subject,
             "eDiscovery search request: Example - Highway 56 contract"
@@ -1706,7 +1719,7 @@ mod tests {
         assert!(body.contains(
             "Whose content to search:\n  - People: jane.doe@example.gov and pat.lee@example.gov"
         ));
-        assert!(body.contains("(x.kql)"));
+        assert!(body.contains("(x.req)"));
     }
 
     #[test]
@@ -1731,10 +1744,10 @@ mod tests {
         s.about.name.clear();
         s.about.kind = RequestKind::PublicData;
         s.keywords.words = v(&["budget"]);
-        assert_eq!(s.file_name(today()), "Data request 2026-10-23.kql");
+        assert_eq!(s.file_name(today()), "Data request 2026-10-23.req");
         assert_eq!(s.display_name(today()), "Data request October 23, 2026");
         assert!(s.build_at(today()).can_save());
-        let (subject, _) = s.email("x.kql", today());
+        let (subject, _) = s.email("x.req", None, today());
         assert_eq!(
             subject,
             "eDiscovery search request: Data request October 23, 2026"
@@ -1760,8 +1773,8 @@ mod tests {
     fn record_has_summary_and_query() {
         let s = SearchRequest::example(today());
         let b = s.build_at(today());
-        let r = s.record("x.kql", &b.query, today());
-        assert!(r.starts_with("eDiscovery search request: Example - Highway 56 contract\nSaved October 23, 2026\nRequest file: x.kql\n"));
+        let r = s.record("x.req", &b.query, today());
+        assert!(r.starts_with("eDiscovery search request: Example - Highway 56 contract\nSaved October 23, 2026\nRequest file: x.req\n"));
         assert!(r.contains("  - Type: Data request from the public\n"));
         assert!(r.contains("  - Reference number: DR-2026-041\n"));
         assert!(r.ends_with(&format!("(Purview KeyQL):\n{}\n", b.query)));
@@ -1864,8 +1877,8 @@ mod tests {
     fn file_name_is_safe() {
         let mut s = named();
         s.about.name = "Smith / Jones: records?".into();
-        assert_eq!(s.file_name(today()), "Smith Jones records 2026-10-23.kql");
+        assert_eq!(s.file_name(today()), "Smith Jones records 2026-10-23.req");
         s.about.name = "  ".into();
-        assert_eq!(s.file_name(today()), "Search request 2026-10-23.kql");
+        assert_eq!(s.file_name(today()), "Search request 2026-10-23.req");
     }
 }

@@ -1,4 +1,5 @@
-//! egui front end: a step-by-step request wizard that saves a `.kql` file.
+//! egui front end: a step-by-step request wizard that saves a `.req` request file, and a
+//! read-only view for opening one.
 //!
 //! The layout follows common form-usability guidance (GOV.UK "one thing per
 //! page" and "check answers", NN/g wizard guidelines): a visible list of steps,
@@ -20,6 +21,7 @@ use crate::query::{
     self, Attachments, DateField, DateMode, Found, KeywordScope, Level, Near, OptionalHolidays,
     RequestKind, SearchRequest, SizeOp, Step,
 };
+use crate::reqfile;
 
 const SOURCE_URL: &str = "https://github.com/simontemplarST/keyql-builder";
 
@@ -126,6 +128,12 @@ struct Settings {
 // App state
 // ---------------------------------------------------------------------------
 
+/// A request file opened to read.
+struct Viewed {
+    file: String,
+    contents: Result<reqfile::Contents, String>,
+}
+
 /// Details found in a pasted request, each with a tick box.
 struct Picks {
     found: Found,
@@ -219,6 +227,10 @@ fn plain_join(parts: &[String]) -> String {
 /// Text typed into a field but not yet turned into a chip or date, keyed by field.
 type Pending = HashMap<String, String>;
 
+/// A file picked or dropped in the browser: (name, bytes), filled in by a callback.
+#[cfg(target_arch = "wasm32")]
+type Incoming = std::rc::Rc<std::cell::RefCell<Option<(String, Vec<u8>)>>>;
+
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct KeyqlApp {
@@ -250,6 +262,13 @@ pub struct KeyqlApp {
     /// Set when the page changes, so the next page opens at the top.
     #[serde(skip)]
     scroll_top: bool,
+    /// A request file opened to read, shown instead of the wizard.
+    #[serde(skip)]
+    viewing: Option<Viewed>,
+    /// A file picked in the browser, handed over from the file input's callback.
+    #[cfg(target_arch = "wasm32")]
+    #[serde(skip)]
+    incoming: Incoming,
     #[serde(skip)]
     applied_zoom: Option<f32>,
     #[serde(skip)]
@@ -324,6 +343,91 @@ impl KeyqlApp {
         out
     }
 
+    fn open_bytes(&mut self, file: String, bytes: &[u8]) {
+        self.viewing = Some(Viewed {
+            file,
+            contents: reqfile::decode(bytes).map_err(|e| e.to_string()),
+        });
+        self.saved = None;
+        self.scroll_top = true;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn open_path(&mut self, path: &std::path::Path) {
+        let file = path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match std::fs::read(path) {
+            Ok(bytes) => self.open_bytes(file, &bytes),
+            Err(e) => {
+                self.viewing = Some(Viewed {
+                    file,
+                    contents: Err(format!("The file couldn't be read: {e}")),
+                });
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn open_file(&mut self, _ctx: &egui::Context) {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Open a request file")
+            .add_filter("eDiscovery request (.req)", &[reqfile::EXTENSION]);
+        if let Some(dir) = documents_dir() {
+            dialog = dialog.set_directory(dir);
+        }
+        if let Some(path) = dialog.pick_file() {
+            self.open_path(&path);
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn open_file(&mut self, ctx: &egui::Context) {
+        pick_file(self.incoming.clone(), ctx.clone());
+    }
+
+    /// Files dropped on the window, and (in the browser) a file picked with Open.
+    fn take_incoming(&mut self, ctx: &egui::Context) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let picked = self.incoming.borrow_mut().take();
+            if let Some((name, bytes)) = picked {
+                self.open_bytes(name, &bytes);
+            }
+        }
+        let Some(f) = ctx.input(|i| i.raw.dropped_files.first().cloned()) else {
+            return;
+        };
+        let name = f
+            .path()
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        #[cfg(not(target_arch = "wasm32"))]
+        match f.bytes() {
+            Ok(bytes) => self.open_bytes(name, &bytes),
+            Err(e) => {
+                self.viewing = Some(Viewed {
+                    file: name,
+                    contents: Err(format!("The file couldn't be read: {e}")),
+                });
+            }
+        }
+        // The browser reads dropped files asynchronously; the bytes arrive like a picked file.
+        #[cfg(target_arch = "wasm32")]
+        {
+            let slot = self.incoming.clone();
+            let ctx = ctx.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Ok(bytes) = f.bytes_async().await {
+                    *slot.borrow_mut() = Some((name, bytes));
+                    ctx.request_repaint();
+                }
+            });
+        }
+    }
+
     fn step_index(&self) -> usize {
         STEPS.iter().position(|s| *s == self.step).unwrap_or(0)
     }
@@ -396,6 +500,7 @@ impl eframe::App for KeyqlApp {
             self.applied_theme = Some(self.settings.theme);
         }
 
+        self.take_incoming(&ctx);
         self.req.holidays = self.settings.holidays;
         let mut built = self.req.build();
         built.notices.extend(self.date_problems());
@@ -405,7 +510,7 @@ impl eframe::App for KeyqlApp {
             .resizable(false)
             .exact_size(250.0)
             .show(ui, |ui| self.step_list(ui, &built));
-        if self.saved.is_none() {
+        if self.saved.is_none() && self.viewing.is_none() {
             egui::Panel::bottom("nav").show(ui, |ui| self.nav_bar(ui, &built));
             // Only when there's room beside the page; the check page shows the same thing in full.
             if ctx.content_rect().width() >= 1200.0 && self.step != Step::Review {
@@ -432,7 +537,9 @@ impl eframe::App for KeyqlApp {
                     .inner_margin(Margin::symmetric(28, 18))
                     .show(ui, |ui| {
                         ui.set_max_width(ui.available_width().min(780.0));
-                        if self.saved.is_some() {
+                        if self.viewing.is_some() {
+                            self.viewer_page(ui);
+                        } else if self.saved.is_some() {
                             self.done_page(ui);
                         } else {
                             self.step_page(ui, &built);
@@ -443,6 +550,7 @@ impl eframe::App for KeyqlApp {
 
         self.reset_dialog(&ctx);
         self.settings_window(&ctx);
+        drop_hint(&ctx);
     }
 }
 
@@ -471,6 +579,13 @@ impl KeyqlApp {
                 if ui.button("Start a new request").clicked() {
                     self.confirm_reset = true;
                 }
+                if ui
+                    .button("Open a request file…")
+                    .on_hover_text("Read a .req file someone sent you and copy its search. You can also drop the file on this window.")
+                    .clicked()
+                {
+                    self.open_file(ui.ctx());
+                }
             });
         });
         ui.add_space(6.0);
@@ -482,7 +597,7 @@ impl KeyqlApp {
         ui.add_space(4.0);
         let mut target = None;
         for (i, &step) in STEPS.iter().enumerate() {
-            let current = step == self.step && self.saved.is_none();
+            let current = step == self.step && self.saved.is_none() && self.viewing.is_none();
             let (state, status) = self.step_status(step, built);
             if step_item(ui, i + 1, step_title(step), state, status, current).clicked() {
                 target = Some(step);
@@ -490,6 +605,7 @@ impl KeyqlApp {
         }
         if let Some(step) = target {
             self.saved = None;
+            self.viewing = None;
             self.go(step);
         }
         ui.add_space(12.0);
@@ -634,7 +750,7 @@ impl KeyqlApp {
                         .on_disabled_hover_text("Fix the problems listed at the top first.")
                         .clicked()
                     {
-                        self.save_file(built);
+                        self.save_file();
                     }
                     ui.label(
                         RichText::new(if !can_save {
@@ -1645,13 +1761,18 @@ impl KeyqlApp {
         }
     }
 
+    /// The request file's bytes: every answer, the summary and the query, fixed as of today.
+    fn request_bytes(&self) -> Vec<u8> {
+        reqfile::encode(&reqfile::Contents::new(&self.req, today()))
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
-    fn save_file(&mut self, built: &query::Built) {
+    fn save_file(&mut self) {
         let name = self.req.file_name(today());
         let mut dialog = rfd::FileDialog::new()
             .set_title("Save search request")
             .set_file_name(&name)
-            .add_filter("Purview search (.kql)", &["kql"]);
+            .add_filter("eDiscovery request (.req)", &[reqfile::EXTENSION]);
         if let Some(dir) = documents_dir() {
             dialog = dialog.set_directory(dir);
         }
@@ -1668,11 +1789,11 @@ impl KeyqlApp {
         };
         if path
             .extension()
-            .is_none_or(|e| !e.eq_ignore_ascii_case("kql"))
+            .is_none_or(|e| !e.eq_ignore_ascii_case(reqfile::EXTENSION))
         {
-            path.set_extension("kql");
+            path.set_extension(reqfile::EXTENSION);
         }
-        match std::fs::write(&path, &built.query) {
+        match std::fs::write(&path, self.request_bytes()) {
             Ok(()) => {
                 self.saved = Some(path);
                 self.save_error = None;
@@ -1685,9 +1806,9 @@ impl KeyqlApp {
     /// In the browser there's no save dialog: the file is downloaded and lands
     /// wherever the browser keeps downloads.
     #[cfg(target_arch = "wasm32")]
-    fn save_file(&mut self, built: &query::Built) {
+    fn save_file(&mut self) {
         let name = self.req.file_name(today());
-        match download(&name, &built.query) {
+        match download(&name, &self.request_bytes(), "application/octet-stream") {
             Ok(()) => {
                 self.saved = Some(PathBuf::from(name));
                 self.save_error = None;
@@ -1700,7 +1821,7 @@ impl KeyqlApp {
     fn record_name(&self) -> String {
         self.req
             .file_name(today())
-            .trim_end_matches(".kql")
+            .trim_end_matches(".req")
             .to_owned()
             + " - record.txt"
     }
@@ -1740,7 +1861,12 @@ impl KeyqlApp {
     fn save_record(&mut self, kql_file: &str, _dir: Option<&std::path::Path>) {
         let name = self.record_name();
         self.record_note = Some(
-            download(&name, &self.record_text(kql_file)).map(|()| format!("Downloaded {name}")),
+            download(
+                &name,
+                self.record_text(kql_file).as_bytes(),
+                "text/plain;charset=utf-8",
+            )
+            .map(|()| format!("Downloaded {name}")),
         );
     }
 
@@ -1785,7 +1911,12 @@ impl KeyqlApp {
         ui.add_space(20.0);
         ui.label(RichText::new("What to do next").size(20.0).strong());
         ui.add_space(4.0);
-        numbered(ui, 1, "Email the file to the IT Director as an attachment.");
+        numbered(
+            ui,
+            1,
+            "Email the request file to the IT Director as an attachment. They open it in this app \
+             with Open a request file.",
+        );
         numbered(
             ui,
             2,
@@ -1799,7 +1930,7 @@ impl KeyqlApp {
         );
         ui.add_space(12.0);
 
-        let (subject, body) = self.req.email(&file, today());
+        let (subject, body) = self.req.email(&file, app_url().as_deref(), today());
         ui.horizontal_wrapped(|ui| {
             if primary_button(ui, "Write the email")
                 .on_hover_text("Opens your email program. Remember to attach the file.")
@@ -1869,6 +2000,104 @@ impl KeyqlApp {
                 self.reset();
             }
         });
+    }
+
+    /// A request file opened to read: its integrity, the query to copy and the summary.
+    fn viewer_page(&mut self, ui: &mut egui::Ui) {
+        let Some(v) = self.viewing.as_ref() else {
+            return;
+        };
+        ui.label(RichText::new("Request file").weak());
+        match &v.contents {
+            Err(msg) => {
+                ui.label(RichText::new(&v.file).size(26.0).strong());
+                ui.add_space(10.0);
+                callout(ui, Tone::Error, "This file can't be opened", |ui| {
+                    ui.label(msg);
+                });
+            }
+            Ok(c) => {
+                ui.label(RichText::new(c.name()).size(26.0).strong());
+                status_line(
+                    ui,
+                    Tone::Success,
+                    format!(
+                        "{} is complete and unchanged since it was saved on {}.",
+                        v.file,
+                        query::long_date(c.saved_on)
+                    ),
+                );
+                ui.add_space(16.0);
+                ui.label(RichText::new("The search to run").size(20.0).strong());
+                ui.label(
+                    RichText::new(
+                        "Paste it into Purview: eDiscovery, your case, Search, Query, then the KeyQL editor.",
+                    )
+                    .weak(),
+                );
+                ui.add_space(4.0);
+                egui::Frame::new()
+                    .fill(ui.visuals().extreme_bg_color)
+                    .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+                    .corner_radius(8)
+                    .inner_margin(Margin::same(14))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.add(
+                            egui::Label::new(RichText::new(&c.query).monospace())
+                                .wrap()
+                                .selectable(true),
+                        );
+                    });
+                ui.add_space(6.0);
+                let now = ui.input(|i| i.time);
+                let copied = self.copied_at.is_some_and(|t| now - t < 2.0);
+                ui.horizontal(|ui| {
+                    if primary_button(ui, if copied { "Copied" } else { "Copy KeyQL query" })
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(c.query.clone());
+                        self.copied_at = Some(now);
+                    }
+                    ui.label(
+                        RichText::new(format!("{} characters", c.query.chars().count())).weak(),
+                    );
+                });
+                if copied {
+                    ui.ctx().request_repaint();
+                }
+                ui.add_space(20.0);
+                ui.label(RichText::new("What was asked for").size(20.0).strong());
+                ui.add_space(4.0);
+                for (heading, lines) in &c.summary {
+                    egui::Frame::new()
+                        .fill(ui.visuals().extreme_bg_color)
+                        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+                        .corner_radius(8)
+                        .inner_margin(Margin::symmetric(16, 12))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(RichText::new(heading).strong());
+                            for l in lines {
+                                ui.add(egui::Label::new(l).wrap().selectable(true));
+                            }
+                        });
+                    ui.add_space(4.0);
+                }
+                if c.app_version != env!("CARGO_PKG_VERSION") {
+                    ui.label(
+                        RichText::new(format!("Saved with version {} of the app.", c.app_version))
+                            .small()
+                            .weak(),
+                    );
+                }
+            }
+        }
+        ui.add_space(16.0);
+        if ui.button("Close").clicked() {
+            self.viewing = None;
+            self.scroll_top = true;
+        }
     }
 
     fn reset_dialog(&mut self, ctx: &egui::Context) {
@@ -2662,16 +2891,16 @@ fn open_link(ctx: &egui::Context, url: &str, new_tab: bool) {
     });
 }
 
-/// Hand `text` to the browser as a file download named `name`.
+/// Hand `bytes` to the browser as a file download named `name`.
 #[cfg(target_arch = "wasm32")]
-fn download(name: &str, text: &str) -> Result<(), String> {
+fn download(name: &str, bytes: &[u8], mime: &str) -> Result<(), String> {
     use wasm_bindgen::JsCast;
     let err = |e: wasm_bindgen::JsValue| format!("{e:?}");
 
-    let parts = js_sys::Array::of1(&text.into());
+    let parts = js_sys::Array::of1(&js_sys::Uint8Array::from(bytes));
     let opts = web_sys::BlobPropertyBag::new();
-    opts.set_type("text/plain;charset=utf-8");
-    let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &opts).map_err(err)?;
+    opts.set_type(mime);
+    let blob = web_sys::Blob::new_with_u8_array_sequence_and_options(&parts, &opts).map_err(err)?;
     let url = web_sys::Url::create_object_url_with_blob(&blob).map_err(err)?;
     let document = web_sys::window()
         .and_then(|w| w.document())
@@ -2686,6 +2915,66 @@ fn download(name: &str, text: &str) -> Result<(), String> {
     a.click();
     let _ = web_sys::Url::revoke_object_url(&url);
     Ok(())
+}
+
+/// Ask the browser for a .req file; its bytes land in `slot` and the app is woken to open it.
+#[cfg(target_arch = "wasm32")]
+fn pick_file(slot: Incoming, ctx: egui::Context) {
+    use wasm_bindgen::JsCast;
+    let Some(input) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.create_element("input").ok())
+        .and_then(|e| e.dyn_into::<web_sys::HtmlInputElement>().ok())
+    else {
+        return;
+    };
+    input.set_type("file");
+    input.set_accept(&format!(".{}", reqfile::EXTENSION));
+    let picked = input.clone();
+    let on_change = wasm_bindgen::closure::Closure::once_into_js(move || {
+        let Some(file) = picked.files().and_then(|f| f.get(0)) else {
+            return;
+        };
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(buf) = wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await {
+                *slot.borrow_mut() = Some((file.name(), js_sys::Uint8Array::new(&buf).to_vec()));
+                ctx.request_repaint();
+            }
+        });
+    });
+    input.set_onchange(Some(on_change.unchecked_ref()));
+    input.click();
+}
+
+/// Where the app can be opened, for the email: the page's own address on the web.
+fn app_url() -> Option<String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let loc = web_sys::window()?.location();
+        Some(format!("{}{}", loc.origin().ok()?, loc.pathname().ok()?))
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    None
+}
+
+/// While a file is dragged over the window, say what dropping it will do.
+fn drop_hint(ctx: &egui::Context) {
+    if ctx.input(|i| i.raw.hovered_files.is_empty()) {
+        return;
+    }
+    let rect = ctx.content_rect();
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::unique("drop_hint"),
+    ));
+    painter.rect_filled(rect, 0, Color32::from_black_alpha(150));
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "Drop a request file (.req) to open it",
+        FontId::proportional(26.0),
+        Color32::WHITE,
+    );
 }
 
 #[cfg(not(target_arch = "wasm32"))]

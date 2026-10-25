@@ -5,7 +5,8 @@
 **Ask for a Microsoft Purview eDiscovery search without knowing any search syntax.**
 
 Staff answer a few plain-language questions. The app writes the KeyQL query for them and saves it as a
-`.kql` file to email to whoever runs Purview searches.
+`.req` request file to email to whoever runs Purview searches, who opens it in the same app and
+copies the query into Purview.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Rust 2024](https://img.shields.io/badge/rust-2024%20edition-orange.svg)
@@ -54,7 +55,8 @@ what they asked for, and whoever runs the search gets an exact, repeatable query
 - **Names are fine.** If you only know a person's name, type the name. The IT Director looks up the mailbox.
 - **A check-your-answers page** that summarizes the request in plain English, with **Change** links.
 - **Problems are explained, not just flagged.** Each problem has a link that takes you to the step to fix it.
-- **Saves a `.kql` file** named after the request and the date, ready to attach to an email.
+- **Saves one `.req` request file** named after the request and the date, ready to attach to an email. It holds every answer, the plain-English summary and the exact KeyQL query.
+- **Opens request files.** The IT Director chooses **Open a request file…** (or drops the file on the window) to read the request and **Copy KeyQL query**.
 - **Writes the email for you.** It opens your mail program with the To, Subject and body filled in, or copies the text.
 - **A copy for your records.** One click saves a text file with what was asked for, the plain-English summary and the exact search.
 - **Remembers your answers** if you close the app, so a half-finished request isn't lost.
@@ -99,17 +101,43 @@ The web version shows this while it loads:
 
 ## The file it makes
 
-The sample request (`--example` on the desktop, `?example` in the browser) produces
-[`docs/example.kql`](docs/example.kql):
+**Save request file…** writes one binary `.req` file. The sample request (`--example` on the desktop,
+`?example` in the browser) is in [`docs/example.req`](docs/example.req).
+
+**For the IT Director:** open the app, choose **Open a request file…** (or drop the file on the window), and you
+see the whole request: the plain-English summary, whose content to search, the deadline if there is one, and
+the search itself with a **Copy KeyQL query** button. Paste it into
+**Purview → eDiscovery → (case) → Search → Query → KeyQL editor**. For the sample request that's:
 
 ```text
 ("Highway 56" AND contract AND (sent:2026-01-01..2026-10-25 OR received:2026-01-01..2026-10-25 OR LastModifiedTime:2026-01-01..2026-10-25) AND (kind:email OR kind:docs) AND HasAttachment:true) NOT newsletter
 ```
 
-The person running the search pastes it into **Purview → eDiscovery → (case) → Search → Query → KeyQL editor**.
+The people and places to search are in the summary, not in the query: Purview picks them separately (as data
+sources).
 
-The people and places to search go in the email, not in the file. Purview picks them separately from the
-query (as data sources), and KeyQL has no comments to carry them.
+<p align="center">
+  <img src="docs/screenshots/open-request.png" alt="A request file opened in the app: integrity line, the query with Copy KeyQL query, and the summary" width="640">
+</p>
+
+### Format
+
+| Offset | Size | Contents |
+|---|---|---|
+| 0 | 8 | `KEYQLREQ` |
+| 8 | 2 | Format version, little-endian (currently 1) |
+| 10 | 4 | Payload length N, little-endian |
+| 14 | N | Payload: the answers, the summary, the query, the save date, the office holidays used for the deadline, and the app version, encoded with [postcard](https://github.com/jamesmunns/postcard) |
+| 14 + N | 4 | CRC-32 (the zip/PNG checksum) of every byte before it, little-endian |
+
+- **The query and summary are fixed when the file is saved,** so "Last 30 days" means the same dates however
+  late the file is opened.
+- **A damaged or altered file is refused:** a changed byte fails the checksum, and the app says the file can't
+  be trusted and should be sent again. A file from a newer version of the app says so.
+- **It isn't encrypted.** Anyone with the app can read it, the same as an email. Send it the way you'd send any
+  other data request.
+
+The code is in [`src/reqfile.rs`](src/reqfile.rs).
 
 ## How answers become KeyQL
 
@@ -222,7 +250,8 @@ trunk serve --release            # http://127.0.0.1:8080   (add ?example for the
 trunk build --release            # static files in dist/
 ```
 
-In the browser, **Save request file…** downloads the `.kql` file, and **Show the file in its folder** is hidden.
+In the browser, **Save request file…** downloads the `.req` file, **Open a request file…** uses the browser's
+file picker, and **Show the file in its folder** is hidden.
 
 > The post-build hook in [`Trunk.toml`](Trunk.toml) fixes the size the loading bar counts to (trunk records the
 > size from before `wasm-opt`). It uses `sh`, `wc` and GNU `sed`; on macOS install `gsed` or drop the hook (the bar
@@ -270,7 +299,8 @@ src/main.rs      desktop window setup, and the browser entry point
 index.html       web page: loading screen and Content-Security-Policy
 loader.mjs       download progress for the loading screen (trunk initializer)
 Trunk.toml       web build settings and the post-build hook
-docs/            screenshots and the sample .kql file
+src/reqfile.rs   the .req request file: layout, checksum, reading and writing (unit tested)
+docs/            screenshots and the sample request file
 ```
 
 Built with [egui / eframe](https://github.com/emilk/egui), [chrono](https://github.com/chronotope/chrono),
