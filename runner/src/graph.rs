@@ -74,6 +74,12 @@ fn transport(e: ureq::Error) -> GraphError {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Payload<'a> {
+    Json(&'a Value),
+    Bytes(&'a [u8], &'a str),
+}
+
 pub struct Reply {
     pub status: u16,
     pub location: Option<String>,
@@ -97,19 +103,27 @@ impl Graph<'_> {
 
     /// One call, retried a few times when Graph is throttling (429) or briefly unavailable (503).
     fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Reply, GraphError> {
+        self.send(method, path, body.map(Payload::Json))
+    }
+
+    fn send(&self, method: &str, path: &str, body: Option<Payload>) -> Result<Reply, GraphError> {
         let url = self.url(path);
         let auth = format!("Bearer {}", self.token);
         for attempt in 0..4 {
-            let res = match body {
-                Some(b) => self
+            let res = match (method, body) {
+                ("GET", _) => self.agent.get(&url).header("Authorization", &auth).call(),
+                ("PUT", Some(Payload::Bytes(bytes, content_type))) => self
+                    .agent
+                    .put(&url)
+                    .header("Authorization", &auth)
+                    .header("Content-Type", content_type)
+                    .send(bytes),
+                (_, Some(Payload::Json(b))) => self
                     .agent
                     .post(&url)
                     .header("Authorization", &auth)
                     .send_json(b),
-                None if method == "GET" => {
-                    self.agent.get(&url).header("Authorization", &auth).call()
-                }
-                None => self
+                _ => self
                     .agent
                     .post(&url)
                     .header("Authorization", &auth)
@@ -273,6 +287,190 @@ impl Graph<'_> {
         Ok(Estimate::from_json(
             &self.call("GET", operation, None)?.body,
         ))
+    }
+}
+
+// ---------------------------------------------------------------- Purview's audit log
+
+/// One record from the Microsoft 365 unified audit log.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuditRecord {
+    pub id: String,
+    pub time: String,
+    pub record_type: String,
+    pub operation: String,
+    pub user: String,
+    pub object_id: String,
+    /// The whole record as Graph sent it, for matching and for showing details.
+    pub raw: Value,
+}
+
+impl AuditRecord {
+    fn from_json(v: &Value) -> Self {
+        Self {
+            id: s(&v["id"]),
+            time: s(&v["createdDateTime"]),
+            record_type: s(&v["auditLogRecordType"]),
+            operation: s(&v["operation"]),
+            user: s(&v["userPrincipalName"]),
+            object_id: s(&v["objectId"]),
+            raw: v.clone(),
+        }
+    }
+}
+
+/// eDiscovery activity in the unified audit log: eDiscovery (Standard) and (Premium).
+pub const EDISCOVERY_RECORD_TYPES: [&str; 2] = ["discovery", "aeD"];
+
+impl Graph<'_> {
+    /// Ask Purview's audit log for eDiscovery activity between two times (RFC 3339), wait for the
+    /// query to finish, and return its records. Needs AuditLogsQuery.Read.All.
+    pub fn purview_audit(
+        &self,
+        start: &str,
+        end: &str,
+        poll: Duration,
+        give_up: Duration,
+    ) -> Result<Vec<AuditRecord>, GraphError> {
+        let body = json!({
+            "displayName": "eDiscovery Search Runner comparison",
+            "filterStartDateTime": start,
+            "filterEndDateTime": end,
+            "recordTypeFilters": EDISCOVERY_RECORD_TYPES,
+        });
+        let q = self
+            .call("POST", "/security/auditLog/queries", Some(&body))?
+            .body;
+        let id = s(&q["id"]);
+        let started = Instant::now();
+        loop {
+            let v = self
+                .call("GET", &format!("/security/auditLog/queries/{id}"), None)?
+                .body;
+            match v["status"].as_str().unwrap_or("") {
+                "succeeded" => break,
+                "failed" | "cancelled" => {
+                    return Err(GraphError {
+                        status: 0,
+                        code: "auditQueryFailed".into(),
+                        message: "Purview couldn't finish the audit log search. Try again later."
+                            .into(),
+                    });
+                }
+                _ if started.elapsed() > give_up => {
+                    return Err(GraphError {
+                        status: 0,
+                        code: "timeout".into(),
+                        message:
+                            "Purview's audit log search is taking too long. Try a shorter period."
+                                .into(),
+                    });
+                }
+                _ => std::thread::sleep(poll),
+            }
+        }
+        let mut out = Vec::new();
+        let mut next = Some(format!("/security/auditLog/queries/{id}/records"));
+        while let Some(path) = next.take() {
+            let v = self.call("GET", &path, None)?.body;
+            out.extend(
+                v["value"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(AuditRecord::from_json),
+            );
+            next = v["@odata.nextLink"].as_str().map(str::to_owned);
+        }
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------- SharePoint copy of the log
+
+/// Percent-encode each part of a drive path, keeping the slashes.
+pub fn encode_path(path: &str) -> String {
+    path.split('/')
+        .map(crate::auth::encode)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+impl Graph<'_> {
+    /// The site ID for `https://contoso.sharepoint.com/sites/Name`. Needs Sites.ReadWrite.All.
+    pub fn site_id(&self, site_url: &str) -> Result<String, GraphError> {
+        let rest = site_url.trim().trim_end_matches('/');
+        let rest = rest.strip_prefix("https://").unwrap_or(rest);
+        let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let path = if path.is_empty() {
+            format!("/sites/{host}")
+        } else {
+            format!("/sites/{host}:/{}", encode_path(path))
+        };
+        Ok(s(&self.call("GET", &path, None)?.body["id"]))
+    }
+
+    /// Make each folder of `folder` in the site's default document library, if it isn't there yet.
+    pub fn ensure_folder(&self, site_id: &str, folder: &str) -> Result<(), GraphError> {
+        let mut parent = String::new();
+        for name in folder.split('/').filter(|p| !p.is_empty()) {
+            let at = if parent.is_empty() {
+                format!("/sites/{site_id}/drive/root/children")
+            } else {
+                format!(
+                    "/sites/{site_id}/drive/root:/{}:/children",
+                    encode_path(&parent)
+                )
+            };
+            let body =
+                json!({"name": name, "folder": {}, "@microsoft.graph.conflictBehavior": "fail"});
+            match self.call("POST", &at, Some(&body)) {
+                Ok(_) => {}
+                Err(e) if e.status == 409 => {}
+                Err(e) => return Err(e),
+            }
+            parent = if parent.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{parent}/{name}")
+            };
+        }
+        Ok(())
+    }
+
+    /// The names of the files already in the folder.
+    pub fn file_names(&self, site_id: &str, folder: &str) -> Result<Vec<String>, GraphError> {
+        let mut out = Vec::new();
+        let mut next = Some(format!(
+            "/sites/{site_id}/drive/root:/{}:/children?$select=name&$top=999",
+            encode_path(folder)
+        ));
+        while let Some(path) = next.take() {
+            let v = self.call("GET", &path, None)?.body;
+            out.extend(
+                v["value"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|f| s(&f["name"])),
+            );
+            next = v["@odata.nextLink"].as_str().map(str::to_owned);
+        }
+        Ok(out)
+    }
+
+    /// Upload a new file. An existing file of the same name is never replaced: Ok(false) says it
+    /// was already there.
+    pub fn upload_new(&self, site_id: &str, path: &str, bytes: &[u8]) -> Result<bool, GraphError> {
+        let url = format!(
+            "/sites/{site_id}/drive/root:/{}:/content?@microsoft.graph.conflictBehavior=fail",
+            encode_path(path)
+        );
+        match self.send("PUT", &url, Some(Payload::Bytes(bytes, "application/json"))) {
+            Ok(_) => Ok(true),
+            Err(e) if e.status == 409 => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -746,6 +944,71 @@ pub mod tests {
         assert_eq!(
             fake.seen.lock().unwrap()[0].2["dataSourceScopes"],
             json!("allTenantMailboxes,allTenantSites")
+        );
+    }
+
+    #[test]
+    fn purview_audit_query_waits_and_pages() {
+        let polls = Arc::new(Mutex::new(0));
+        let p2 = polls.clone();
+        let fake = fake_graph(move |method, path, _, host| match (method, path) {
+            ("POST", "/v1.0/security/auditLog/queries") => {
+                (201, vec![], json!({"id": "q1", "status": "notStarted"}))
+            }
+            ("GET", "/v1.0/security/auditLog/queries/q1") => {
+                let mut n = p2.lock().unwrap();
+                *n += 1;
+                (
+                    200,
+                    vec![],
+                    json!({"id": "q1", "status": if *n < 2 { "running" } else { "succeeded" }}),
+                )
+            }
+            ("GET", "/v1.0/security/auditLog/queries/q1/records") => (
+                200,
+                vec![],
+                json!({
+                "value": [{"id": "a", "operation": "SearchCreated", "auditLogRecordType": "discovery",
+                           "userPrincipalName": "pat@contoso.gov", "createdDateTime": "2026-10-25T10:00:00Z"}],
+                "@odata.nextLink": format!("{host}/v1.0/security/auditLog/queries/q1/records?page=2")}),
+            ),
+            ("GET", p) if p.contains("page=2") => (
+                200,
+                vec![],
+                json!({"value": [{"id": "b", "operation": "SearchStarted", "auditLogRecordType": "aeD"}]}),
+            ),
+            _ => (
+                404,
+                vec![],
+                json!({"error": {"code": "NotFound", "message": path}}),
+            ),
+        });
+        let agent = agent();
+        let g = Graph {
+            agent: &agent,
+            base: format!("{}/v1.0", fake.base),
+            token: "t".into(),
+        };
+        let recs = g
+            .purview_audit(
+                "2026-10-18T00:00:00Z",
+                "2026-10-25T23:59:59Z",
+                Duration::from_millis(5),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(
+            recs.iter()
+                .map(|r| r.operation.as_str())
+                .collect::<Vec<_>>(),
+            vec!["SearchCreated", "SearchStarted"]
+        );
+        assert_eq!(recs[0].user, "pat@contoso.gov");
+        let seen = fake.seen.lock().unwrap();
+        assert_eq!(seen[0].2["recordTypeFilters"], json!(["discovery", "aeD"]));
+        assert_eq!(
+            seen[0].2["filterStartDateTime"],
+            json!("2026-10-18T00:00:00Z")
         );
     }
 

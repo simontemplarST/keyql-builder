@@ -17,6 +17,8 @@ use sha2::{Digest, Sha256};
 
 pub const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 pub const FILE_NAME: &str = "audit-log.jsonl";
+/// Next to the log: a random ID for this log, so copies from several PCs don't mix.
+const ID_FILE: &str = "audit-log.id";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Entry {
@@ -147,6 +149,28 @@ impl AuditLog {
         Ok(entry)
     }
 
+    /// This log's ID, made the first time it's asked for and kept next to the log.
+    pub fn log_id(&self) -> std::io::Result<String> {
+        let path = self.path.with_file_name(ID_FILE);
+        if let Ok(id) = fs::read_to_string(&path) {
+            let id = id.trim();
+            if !id.is_empty() {
+                return Ok(id.to_owned());
+            }
+        }
+        let id = crate::auth::random_token(9).replace(['-', '_'], "x");
+        fs::write(&path, &id)?;
+        Ok(id)
+    }
+
+    /// Every entry with its exact line from the file, oldest first.
+    pub fn raw_entries(&self) -> Vec<(Entry, String)> {
+        self.lines()
+            .into_iter()
+            .filter_map(|l| serde_json::from_str(&l).ok().map(|e| (e, l)))
+            .collect()
+    }
+
     /// Every entry that can be read, oldest first.
     pub fn entries(&self) -> Vec<Entry> {
         self.lines()
@@ -233,6 +257,10 @@ mod tests {
         assert_eq!(e.seq, 4);
         assert_eq!(e.prev, v.fingerprint);
         assert!(again.verify().ok());
+        let id = again.log_id().unwrap();
+        assert_eq!(id.len(), 12);
+        assert_eq!(AuditLog::open(&d).unwrap().log_id().unwrap(), id);
+        assert_eq!(again.raw_entries().len(), 4);
         let _ = fs::remove_dir_all(&d);
     }
 

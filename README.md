@@ -183,7 +183,45 @@ names the admin left out, the estimate's results, sign-ins, sign-outs, settings 
 - **Format.** JSON Lines (`audit-log.jsonl`), so other tools can read it. Choose a shared, backed-up folder in
   Settings.
 - **Purview keeps its own record too:** searches created through the API appear in Purview's audit log under the
-  admin's account.
+  admin's account. See below for checking one against the other.
+
+### Records in Microsoft 365
+
+<p align="center">
+  <img src="docs/screenshots/runner-m365.png" alt="The audit log page: copy in SharePoint up to date, and a comparison with Purview's audit log" width="640">
+</p>
+
+Apps can't write entries into Microsoft Entra's or Purview's audit logs, so the runner keeps its own log, and
+then ties it to Microsoft 365 in two ways.
+
+**A copy in SharePoint.** Every entry is also saved as a file in a SharePoint document library (Settings → **SharePoint
+site**), one JSON file per entry, named `00000042-search_created.json`, in a folder for that runner PC's log
+(`eDiscovery Search Runner audit log/log-<id>/`).
+
+- **Exact lines.** Each file is the entry's exact line from the local log, hash chain included, so the copy can be
+  checked on its own.
+- **Never overwritten.** Uploads use "fail if it exists", so a file already in SharePoint is never replaced.
+- **Uploaded as the admin,** so SharePoint's "Created by" shows who.
+- **Catches up automatically.** While someone is signed in, new entries are copied as they're written, including
+  ones logged before sign-in. If SharePoint can't be reached it tries again every minute. The failure is logged
+  once, and the Audit log page shows how many entries are waiting.
+- **Retention:** put a retention label on the folder or library (Microsoft Purview → Records management). A label
+  that marks items as records makes the files undeletable and unchangeable for the retention period.
+
+**Compare with Purview's audit log.** On the Audit log page, pick a period and choose **Compare**. The runner asks
+Purview's audit log (the Microsoft 365 unified audit log) for its eDiscovery records over that period. It matches
+them to each search the runner created, by the case and search IDs or names. Each search shows as:
+
+- **Confirmed:** Purview has a matching record, and its activities are listed.
+- **Not recorded yet:** less than a day old; Purview can take that long to record activity.
+- **Missing:** older than a day, and Purview has no record of it.
+
+eDiscovery activity Purview recorded that **wasn't** done through the runner is listed separately, for example a
+search someone ran directly in the Purview portal. Each comparison's results are written to the runner's own log.
+
+How long Microsoft keeps its records depends on licensing: Purview's audit log keeps 180 days by default, and 1 year
+for users with E5 or Purview Suite licenses. An audit retention policy can keep eDiscovery records for up to 10 years
+with the add-on license. Entra's sign-in logs are kept 7 or 30 days.
 
 ### Security
 
@@ -201,13 +239,29 @@ You need an account that can register apps and grant admin consent in Microsoft 
    - Name: `eDiscovery Search Runner`. Supported account types: **this organizational directory only**.
    - Redirect URI: platform **Public client/native (mobile & desktop)**, URI `http://localhost`.
      (Any port is allowed for `http://localhost`; the runner picks a free one each time.)
-2. **Permissions.** **API permissions** → **Add a permission** → **Microsoft Graph** → **Delegated**:
-   `eDiscovery.ReadWrite.All` and `User.Read`. Then **Grant admin consent**.
+2. **Permissions.** **API permissions** → **Add a permission** → **Microsoft Graph** → **Delegated**, then **Grant admin
+   consent**:
+
+   | Permission | For |
+   |---|---|
+   | `eDiscovery.ReadWrite.All` | creating cases and searches and running estimates |
+   | `AuditLogsQuery.Read.All` | **Compare** with Purview's audit log |
+   | `Sites.ReadWrite.All` | saving the log's copy to SharePoint |
+   | `User.Read` | showing who signed in |
+
+   All are delegated, so the runner can only do what the signed-in admin can already do.
 3. **Purview role.** The admins who will run searches need the **eDiscovery Manager** role group (their own
    cases) or **eDiscovery Administrator** (all cases) in the Microsoft Purview portal → **Settings** → **Roles and
    scopes**.
-4. **Settings in the runner.** Copy the registration's **Directory (tenant) ID** and **Application (client) ID**
-   into **Settings**, and choose where the audit log lives.
+   To use **Compare**, they also need permission to search the audit log: the **Audit Reader** role group, or any role
+   group with the View-Only Audit Logs role.
+4. **SharePoint.** Choose a site for the log's copy, such as the eDiscovery team's site. The admins need permission to
+   add files there, and nobody else should be able to edit it. Optionally apply a retention label (see
+   [Records in Microsoft 365](#records-in-microsoft-365)).
+5. **Purview audit retention.** In Purview → **Audit** → **Audit retention policies**, add a policy for the
+   eDiscovery record types, for as long as your records schedule requires.
+6. **Settings in the runner.** Copy the registration's **Directory (tenant) ID** and **Application (client) ID**
+   into **Settings**. Choose where the local audit log lives, and enter the SharePoint site.
 
 Optional hardening: on the app's **Enterprise application**, set **Assignment required** to **Yes** and assign only
 the eDiscovery admins, so nobody else can even sign in to it.
@@ -308,8 +362,9 @@ cargo run --release -p keyql-runner      # the search runner
 cargo test --workspace                   # every test: query, request file, sign-in, Graph calls, audit log
 ```
 
-The runner's tests include a full sign-in and a full create-and-estimate run against local stand-ins for
-Microsoft's sign-in and Graph services; they don't touch a real tenant.
+The runner's tests use local stand-ins for Microsoft's sign-in and Graph services and don't touch a real tenant.
+They cover a full sign-in, a full create-and-estimate run, Purview audit log queries, and copying the log to
+SharePoint (only new entries, never overwriting).
 
 The release binary is in `target/release/` (`keyql-builder.exe` on Windows, which opens no console window).
 Answers are saved in `%APPDATA%\keyql-builder\` on Windows, `~/Library/Application Support/keyql-builder/`
@@ -383,6 +438,8 @@ runner/src/auth.rs  sign-in: OAuth 2.0 + PKCE with a loopback redirect, token re
 runner/src/graph.rs the Microsoft Graph eDiscovery calls and the create-and-estimate run
 runner/src/plan.rs  turning a request into mailboxes, sites and Purview names
 runner/src/audit.rs the hash-chained audit log
+runner/src/mirror.rs   the audit log's copy in SharePoint
+runner/src/purview.rs  comparing the log with Purview's audit log
 runner/src/app.rs   the runner's screens
 docs/               screenshots and the sample request file
 ```

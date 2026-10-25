@@ -20,8 +20,12 @@ use serde_json::json;
 
 use crate::audit::{self, AuditLog, Entry, Verification};
 use crate::auth::{self, AuthConfig, Tokens};
-use crate::graph::{self, Case, CaseTarget, Estimate, Graph, Progress, RunFailed, RunJob};
+use crate::graph::{
+    self, AuditRecord, Case, CaseTarget, Estimate, Graph, Progress, RunFailed, RunJob,
+};
+use crate::mirror;
 use crate::plan::{self, Names, SourceKind, SourcePlan};
+use crate::purview::{self, Comparison, Status};
 
 /// How often to check on a running estimate, and how long to wait before leaving it to Purview.
 const POLL: Duration = Duration::from_secs(5);
@@ -36,6 +40,11 @@ pub struct Settings {
     pub client_id: String,
     /// Where the audit log lives; empty means the app's data folder.
     pub log_dir: String,
+    /// SharePoint site that keeps a copy of the audit log, e.g. https://contoso.sharepoint.com/sites/eDiscovery.
+    /// Empty: no copy.
+    pub sp_site: String,
+    /// Folder in that site's document library; empty means the default name.
+    pub sp_folder: String,
 }
 
 impl Settings {
@@ -99,6 +108,8 @@ enum Msg {
     Cases(Result<Vec<Case>, String>),
     Progress(Progress),
     RunDone(Result<Estimate, RunFailed>),
+    Mirror(mirror::Known, Result<usize, String>),
+    Compared(Result<(Vec<AuditRecord>, String, String), String>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -163,6 +174,19 @@ pub struct RunnerApp {
     opened_count: u32,
     verification: Option<Verification>,
     entries: Vec<Entry>,
+
+    /// The SharePoint copy of the log: what's there, and whether a copy is due or running.
+    mirror: mirror::Known,
+    mirror_due: bool,
+    mirror_running: bool,
+    mirror_note: Option<Result<String, String>>,
+    mirror_retry_at: Option<std::time::Instant>,
+
+    /// Comparing with Purview's audit log.
+    compare_days: i64,
+    comparing: bool,
+    comparison: Option<(Comparison, Vec<AuditRecord>, String, String)>,
+    compare_error: Option<String>,
 }
 
 impl RunnerApp {
@@ -199,6 +223,15 @@ impl RunnerApp {
             run: None,
             verification: None,
             entries: Vec::new(),
+            mirror: mirror::Known::default(),
+            mirror_due: false,
+            mirror_running: false,
+            mirror_note: None,
+            mirror_retry_at: None,
+            compare_days: 7,
+            comparing: false,
+            comparison: None,
+            compare_error: None,
         };
         app.open_audit();
         app.log(
@@ -242,10 +275,11 @@ impl RunnerApp {
     /// Write an audit entry. If the log can't be written, say so: nothing is run without it.
     fn log(&mut self, event: &str, details: serde_json::Value) {
         let actor = self.actor();
-        if let Ok(a) = &mut self.audit
-            && let Err(e) = a.append(&actor, event, details)
-        {
-            self.audit = Err(format!("The audit log couldn't be written: {e}"));
+        if let Ok(a) = &mut self.audit {
+            match a.append(&actor, event, details) {
+                Ok(_) => self.mirror_due = true,
+                Err(e) => self.audit = Err(format!("The audit log couldn't be written: {e}")),
+            }
         }
     }
 
@@ -255,13 +289,17 @@ impl RunnerApp {
 
     // ---------------------------------------------------------------- background work
 
+    /// Run `job` off the UI thread. With a label, the app shows it as busy (no runs meanwhile);
+    /// background chores like copying the log pass None.
     fn spawn(
         &mut self,
-        label: &'static str,
+        label: Option<&'static str>,
         ctx: &egui::Context,
         job: impl FnOnce(Sender<Msg>) + Send + 'static,
     ) {
-        self.busy = Some(label);
+        if label.is_some() {
+            self.busy = label;
+        }
         let tx = self.tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
@@ -280,7 +318,7 @@ impl RunnerApp {
             json!({"tenant": cfg.tenant, "client_id": cfg.client_id}),
         );
         self.spawn(
-            "Waiting for you to sign in in your browser…",
+            Some("Waiting for you to sign in in your browser…"),
             ctx,
             move |tx| {
                 let agent = graph::agent();
@@ -311,7 +349,7 @@ impl RunnerApp {
     /// A job that needs a valid access token: refreshes it first when it's about to run out.
     fn with_token(
         &mut self,
-        label: &'static str,
+        label: Option<&'static str>,
         ctx: &egui::Context,
         job: impl FnOnce(&Graph, &Sender<Msg>) + Send + 'static,
     ) {
@@ -346,7 +384,7 @@ impl RunnerApp {
 
     fn load_cases(&mut self, ctx: &egui::Context) {
         self.cases_error = None;
-        self.with_token("Loading eDiscovery cases…", ctx, |g, tx| {
+        self.with_token(Some("Loading eDiscovery cases…"), ctx, |g, tx| {
             let _ = tx.send(Msg::Cases(g.list_cases().map_err(|e| e.to_string())));
         });
     }
@@ -398,12 +436,67 @@ impl RunnerApp {
         });
         self.log("run_started", details);
         self.run = Some(Run::default());
-        self.with_token("Running the search in Purview…", ctx, move |g, tx| {
-            let mut send = |p| {
-                let _ = tx.send(Msg::Progress(p));
-            };
-            let result = graph::run(g, &job, POLL, GIVE_UP, &mut send);
-            let _ = tx.send(Msg::RunDone(result));
+        self.with_token(
+            Some("Running the search in Purview…"),
+            ctx,
+            move |g, tx| {
+                let mut send = |p| {
+                    let _ = tx.send(Msg::Progress(p));
+                };
+                let result = graph::run(g, &job, POLL, GIVE_UP, &mut send);
+                let _ = tx.send(Msg::RunDone(result));
+            },
+        );
+    }
+
+    /// Copy any new audit entries to SharePoint, when that's set up and someone is signed in.
+    fn mirror_if_due(&mut self, ctx: &egui::Context) {
+        let site = self.settings.sp_site.trim().to_owned();
+        if !self.mirror_due || self.mirror_running || self.tokens.is_none() || site.is_empty() {
+            return;
+        }
+        if self
+            .mirror_retry_at
+            .is_some_and(|t| std::time::Instant::now() < t)
+        {
+            return;
+        }
+        let Ok(a) = &self.audit else { return };
+        let log_id = match a.log_id() {
+            Ok(id) => id,
+            Err(e) => {
+                self.mirror_note = Some(Err(format!("The log's ID couldn't be saved: {e}")));
+                self.mirror_due = false;
+                return;
+            }
+        };
+        let folder = mirror::folder_for(&self.settings.sp_folder, &log_id);
+        let entries = a.raw_entries();
+        let mut known = self.mirror.clone();
+        self.mirror_due = false;
+        self.mirror_running = true;
+        self.with_token(None, ctx, move |g, tx| {
+            let r =
+                mirror::sync(g, &site, &folder, &entries, &mut known).map_err(|e| e.to_string());
+            let _ = tx.send(Msg::Mirror(known, r));
+        });
+    }
+
+    fn start_compare(&mut self, ctx: &egui::Context) {
+        let end = chrono::Utc::now();
+        let start = end - chrono::Duration::days(self.compare_days);
+        let (start, end) = (
+            start.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            end.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        );
+        self.comparing = true;
+        self.compare_error = None;
+        self.with_token(None, ctx, move |g, tx| {
+            let r = g
+                .purview_audit(&start, &end, POLL, Duration::from_secs(15 * 60))
+                .map(|recs| (recs, start, end))
+                .map_err(|e| e.to_string());
+            let _ = tx.send(Msg::Compared(r));
         });
     }
 
@@ -411,6 +504,7 @@ impl RunnerApp {
         match msg {
             Msg::SignedIn(Ok((tokens, me))) => {
                 self.busy = None;
+                self.mirror_retry_at = None;
                 let u = tokens.user.clone();
                 self.tokens = Some(tokens);
                 self.me = me;
@@ -447,6 +541,64 @@ impl RunnerApp {
                 }
             }
             Msg::Progress(p) => self.progress(p),
+            Msg::Mirror(known, r) => {
+                self.mirror_running = false;
+                self.mirror = known;
+                match r {
+                    Ok(n) => {
+                        let first_failure_over = matches!(self.mirror_note, Some(Err(_)));
+                        self.mirror_retry_at = None;
+                        self.mirror_note = Some(Ok(if n == 0 {
+                            "Up to date.".to_owned()
+                        } else {
+                            format!("Copied {n} new entr{}.", if n == 1 { "y" } else { "ies" })
+                        }));
+                        if first_failure_over {
+                            self.log("sharepoint_copy_resumed", json!({}));
+                        }
+                    }
+                    Err(e) => {
+                        let already_failing = matches!(self.mirror_note, Some(Err(_)));
+                        self.mirror_retry_at =
+                            Some(std::time::Instant::now() + Duration::from_secs(60));
+                        self.mirror_note = Some(Err(e.clone()));
+                        // One entry per run of failures, or every retry would add another.
+                        if !already_failing {
+                            self.log("sharepoint_copy_failed", json!({"reason": e}));
+                        }
+                        self.mirror_due = true;
+                    }
+                }
+            }
+            Msg::Compared(r) => {
+                self.comparing = false;
+                match r {
+                    Ok((records, start, end)) => {
+                        let runs: Vec<_> = self
+                            .audit
+                            .as_ref()
+                            .map(|a| purview::runs(&a.entries()))
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|r| r.time.as_str() >= start.as_str())
+                            .collect();
+                        let c = purview::compare(runs, &records, chrono::Utc::now());
+                        let confirmed = c.count(|s| matches!(s, Status::Confirmed(_)));
+                        let waiting = c.count(|s| matches!(s, Status::Waiting));
+                        let missing = c.count(|s| matches!(s, Status::Missing));
+                        self.log(
+                            "purview_compared",
+                            json!({"from": start, "to": end, "purview_records": records.len(), "searches": c.runs.len(),
+                                   "confirmed": confirmed, "waiting": waiting, "missing": missing, "outside_runner": c.outside.len()}),
+                        );
+                        self.comparison = Some((c, records, start, end));
+                    }
+                    Err(e) => {
+                        self.log("purview_compare_failed", json!({"reason": e}));
+                        self.compare_error = Some(e);
+                    }
+                }
+            }
             Msg::RunDone(r) => {
                 self.busy = None;
                 let Some(run) = self.run.as_mut() else { return };
@@ -688,6 +840,13 @@ impl eframe::App for RunnerApp {
         let ctx = ui.ctx().clone();
         while let Ok(m) = self.rx.try_recv() {
             self.handle(m, &ctx);
+        }
+        self.mirror_if_due(&ctx);
+        if self.mirror_running
+            || self.comparing
+            || (self.mirror_due && self.mirror_retry_at.is_some())
+        {
+            ctx.request_repaint_after(Duration::from_millis(500));
         }
         if self.busy.is_some() {
             ctx.request_repaint_after(Duration::from_millis(250));
@@ -1251,6 +1410,11 @@ impl RunnerApp {
             );
         }
         ui.add_space(12.0);
+        self.sharepoint_section(ui);
+        self.purview_section(ui);
+        ui.add_space(18.0);
+        ui.label(RichText::new("All entries").size(19.0).strong());
+        ui.add_space(4.0);
         egui::Grid::new("audit_entries")
             .striped(true)
             .num_columns(4)
@@ -1277,6 +1441,229 @@ impl RunnerApp {
                     ui.end_row();
                 }
             });
+    }
+
+    /// Where the log's copy in Microsoft 365 stands.
+    fn sharepoint_section(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(18.0);
+        ui.label(RichText::new("Copy in SharePoint").size(19.0).strong());
+        let site = self.settings.sp_site.trim().to_owned();
+        if site.is_empty() {
+            ui.label(
+                RichText::new("Not set up. Add a SharePoint site in Settings to keep a copy of every entry in Microsoft 365.")
+                    .weak(),
+            );
+            return;
+        }
+        let Ok(a) = &self.audit else { return };
+        let entries = a.raw_entries();
+        let folder = a
+            .log_id()
+            .map(|id| mirror::folder_for(&self.settings.sp_folder, &id))
+            .unwrap_or_default();
+        ui.label(RichText::new(format!("{site}  ›  {folder}")).small().weak());
+        let known = !self.mirror.site_id.is_empty();
+        let pending = mirror::pending(&entries, &self.mirror);
+        if self.mirror_running {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Copying…");
+            });
+        } else if self.tokens.is_none() {
+            status_line(ui, Tone::Warning, "Sign in to copy entries to SharePoint.");
+        } else if let Some(Err(e)) = &self.mirror_note {
+            status_line(
+                ui,
+                Tone::Error,
+                format!("The last copy failed: {e} It's tried again every minute."),
+            );
+        } else if known && pending == 0 {
+            status_line(
+                ui,
+                Tone::Success,
+                format!("All {} entries are in SharePoint.", entries.len()),
+            );
+        } else if known {
+            status_line(
+                ui,
+                Tone::Info,
+                format!(
+                    "{pending} entr{} waiting to be copied.",
+                    if pending == 1 { "y" } else { "ies" }
+                ),
+            );
+        }
+        let ctx = ui.ctx().clone();
+        if self.tokens.is_some()
+            && !self.mirror_running
+            && ui
+                .button("Copy now")
+                .on_hover_text("Checks the folder again and copies anything missing.")
+                .clicked()
+        {
+            self.mirror = mirror::Known::default();
+            self.mirror_retry_at = None;
+            self.mirror_due = true;
+            self.mirror_if_due(&ctx);
+        }
+    }
+
+    /// Compare the runner's searches with what Purview's own audit log recorded.
+    fn purview_section(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(18.0);
+        ui.label(
+            RichText::new("Compare with Purview's audit log")
+                .size(19.0)
+                .strong(),
+        );
+        ui.label(
+            RichText::new("Purview records eDiscovery activity under the admin's account. Each search made here should appear there; activity that wasn't done through this app is listed too. Purview can take up to a day to record activity.")
+                .weak(),
+        );
+        if self.tokens.is_none() {
+            ui.label(RichText::new("Sign in to compare.").weak());
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.label("Period");
+            egui::ComboBox::from_id_salt("compare_days")
+                .selected_text(format!("Last {} days", self.compare_days))
+                .show_ui(ui, |ui| {
+                    for d in [7, 30, 90, 180] {
+                        ui.selectable_value(&mut self.compare_days, d, format!("Last {d} days"));
+                    }
+                });
+            if self.comparing {
+                ui.spinner();
+                ui.label("Searching Purview's audit log. This can take a few minutes…");
+            } else if ui.button("Compare").clicked() {
+                let ctx = ui.ctx().clone();
+                self.start_compare(&ctx);
+            }
+        });
+        if let Some(e) = &self.compare_error {
+            status_line(ui, Tone::Error, e.as_str());
+        }
+        let Some((c, records, start, end)) = &self.comparison else {
+            return;
+        };
+        let day = |t: &str| t.get(..10).unwrap_or(t).to_owned();
+        ui.add_space(6.0);
+        let confirmed = c.count(|s| matches!(s, Status::Confirmed(_)));
+        let waiting = c.count(|s| matches!(s, Status::Waiting));
+        let missing = c.count(|s| matches!(s, Status::Missing));
+        ui.label(format!(
+            "{} to {}: {} search{} made here, {} eDiscovery record{} in Purview.",
+            day(start),
+            day(end),
+            c.runs.len(),
+            if c.runs.len() == 1 { "" } else { "es" },
+            records.len(),
+            if records.len() == 1 { "" } else { "s" },
+        ));
+        if !c.runs.is_empty() {
+            status_line(
+                ui,
+                if missing > 0 {
+                    Tone::Error
+                } else if waiting > 0 {
+                    Tone::Info
+                } else {
+                    Tone::Success
+                },
+                format!(
+                    "{confirmed} confirmed by Purview, {waiting} not recorded yet, {missing} missing from Purview's log."
+                ),
+            );
+        }
+        if !c.outside.is_empty() {
+            status_line(
+                ui,
+                Tone::Warning,
+                format!(
+                    "{} eDiscovery action{} in Purview {} done through this app.",
+                    c.outside.len(),
+                    if c.outside.len() == 1 { "" } else { "s" },
+                    if c.outside.len() == 1 {
+                        "wasn't"
+                    } else {
+                        "weren't"
+                    }
+                ),
+            );
+        }
+        if !c.runs.is_empty() {
+            ui.add_space(6.0);
+            egui::Grid::new("compare_runs")
+                .striped(true)
+                .num_columns(4)
+                .spacing([16.0, 6.0])
+                .show(ui, |ui| {
+                    for h in ["Search made here", "When", "Who", "In Purview's log"] {
+                        ui.label(RichText::new(h).strong());
+                    }
+                    ui.end_row();
+                    for (run, status) in &c.runs {
+                        ui.add(egui::Label::new(RichText::new(&run.search_name).small()).wrap());
+                        ui.label(RichText::new(local_time(&run.time)).monospace().small());
+                        ui.label(RichText::new(&run.actor).small());
+                        match status {
+                            Status::Confirmed(hits) => {
+                                let ops: Vec<&str> = hits
+                                    .iter()
+                                    .map(|&i| records[i].operation.as_str())
+                                    .collect();
+                                ui.horizontal(|ui| {
+                                    badge(ui, Tone::Success, 14.0);
+                                    ui.add(
+                                        egui::Label::new(RichText::new(ops.join(", ")).small())
+                                            .wrap(),
+                                    );
+                                });
+                            }
+                            Status::Waiting => {
+                                ui.horizontal(|ui| {
+                                    badge(ui, Tone::Info, 14.0);
+                                    ui.label(RichText::new("Not recorded yet").small());
+                                });
+                            }
+                            Status::Missing => {
+                                ui.horizontal(|ui| {
+                                    badge(ui, Tone::Error, 14.0);
+                                    ui.label(
+                                        RichText::new("Missing")
+                                            .small()
+                                            .color(tone_color(ui, Tone::Error)),
+                                    );
+                                });
+                            }
+                        }
+                        ui.end_row();
+                    }
+                });
+        }
+        if !c.outside.is_empty() {
+            ui.add_space(8.0);
+            ui.label(RichText::new("In Purview's log but not done through this app").strong());
+            egui::Grid::new("compare_outside")
+                .striped(true)
+                .num_columns(4)
+                .spacing([16.0, 6.0])
+                .show(ui, |ui| {
+                    for h in ["When", "Who", "Activity", "On"] {
+                        ui.label(RichText::new(h).strong());
+                    }
+                    ui.end_row();
+                    for &i in c.outside.iter().take(200) {
+                        let r = &records[i];
+                        ui.label(RichText::new(local_time(&r.time)).monospace().small());
+                        ui.label(RichText::new(&r.user).small());
+                        ui.label(RichText::new(&r.operation).small().strong());
+                        ui.add(egui::Label::new(RichText::new(&r.object_id).small()).wrap());
+                        ui.end_row();
+                    }
+                });
+        }
     }
 
     fn settings_window(&mut self, ctx: &egui::Context) {
@@ -1311,6 +1698,25 @@ impl RunnerApp {
                         .desired_width(460.0)
                         .hint_text(default_log_dir().display().to_string()),
                 );
+                ui.add_space(10.0);
+                ui.label(RichText::new("Copy in Microsoft 365").size(17.0).strong());
+                field_label(
+                    ui,
+                    "SharePoint site",
+                    None,
+                    "Every entry is also saved as a file in this site's document library. Leave empty for no copy.",
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut draft.sp_site)
+                        .desired_width(460.0)
+                        .hint_text("https://contoso.sharepoint.com/sites/eDiscovery"),
+                );
+                field_label(ui, "Folder", None, "In the site's Documents library. Each runner PC gets its own folder inside it.");
+                ui.add(
+                    egui::TextEdit::singleline(&mut draft.sp_folder)
+                        .desired_width(460.0)
+                        .hint_text(mirror::DEFAULT_FOLDER),
+                );
                 ui.add_space(14.0);
                 if primary_button(ui, "Done").clicked() {
                     done = true;
@@ -1323,8 +1729,16 @@ impl RunnerApp {
                 self.log(
                     "settings_changed",
                     json!({"tenant": [old.tenant, self.settings.tenant], "client_id": [old.client_id, self.settings.client_id],
-                           "log_dir": [old.log_dir, self.settings.log_dir]}),
+                           "log_dir": [old.log_dir, self.settings.log_dir],
+                           "sharepoint_site": [old.sp_site, self.settings.sp_site], "sharepoint_folder": [old.sp_folder, self.settings.sp_folder]}),
                 );
+                if old.sp_site != self.settings.sp_site || old.sp_folder != self.settings.sp_folder
+                {
+                    self.mirror = mirror::Known::default();
+                    self.mirror_note = None;
+                    self.mirror_retry_at = None;
+                    self.mirror_due = true;
+                }
                 if old.log_dir != self.settings.log_dir {
                     self.open_audit();
                     self.log(
@@ -1367,6 +1781,17 @@ fn details_text(v: &serde_json::Value) -> String {
         })
         .collect::<Vec<_>>()
         .join("  ·  ")
+}
+
+/// An RFC 3339 time as local "YYYY-MM-DD HH:MM:SS".
+fn local_time(t: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(t)
+        .map(|t| {
+            t.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_else(|_| t.to_owned())
 }
 
 fn case_label(c: &Case) -> String {

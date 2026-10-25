@@ -19,7 +19,10 @@ use sha2::{Digest, Sha256};
 
 pub const AUTHORITY: &str = "https://login.microsoftonline.com";
 /// Delegated permissions: run eDiscovery as the signed-in admin, and read who they are.
+/// Also read Purview's audit log (to compare), and write the log's copy to SharePoint.
 pub const SCOPES: &str = "https://graph.microsoft.com/eDiscovery.ReadWrite.All \
+                          https://graph.microsoft.com/AuditLogsQuery.Read.All \
+                          https://graph.microsoft.com/Sites.ReadWrite.All \
                           https://graph.microsoft.com/User.Read offline_access openid profile";
 /// How long to wait for the admin to finish signing in in the browser.
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);

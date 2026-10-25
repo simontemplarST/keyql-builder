@@ -8,7 +8,9 @@ mod app;
 mod audit;
 mod auth;
 mod graph;
+mod mirror;
 mod plan;
+mod purview;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
