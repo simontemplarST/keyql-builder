@@ -122,12 +122,72 @@ pub const SENSITIVE_TYPES: &[(&str, &str)] = &[
 // Model
 // ---------------------------------------------------------------------------
 
+/// What kind of request this is, in the words a Responsible Authority uses.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum RequestKind {
+    #[default]
+    NotSaid,
+    PublicData,
+    AboutThemselves,
+    LegalHold,
+    Personnel,
+    Other,
+}
+
+impl RequestKind {
+    pub const ALL: [RequestKind; 5] = [
+        Self::PublicData,
+        Self::AboutThemselves,
+        Self::LegalHold,
+        Self::Personnel,
+        Self::Other,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NotSaid => "Not said",
+            Self::PublicData => "Data request from the public",
+            Self::AboutThemselves => "Someone asking for data about themselves",
+            Self::LegalHold => "Lawsuit or legal hold",
+            Self::Personnel => "Personnel or internal investigation",
+            Self::Other => "Something else",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::NotSaid => "",
+            Self::PublicData => "A member of the public or the media wants to see government data.",
+            Self::AboutThemselves => "A person wants to see the data kept about them.",
+            Self::LegalHold => "An attorney needs records kept or collected for a case.",
+            Self::Personnel => "HR or a manager needs records about an employee matter.",
+            Self::Other => "Any other reason to search email, chats or files.",
+        }
+    }
+
+    /// Used for the file name and email subject when the request has no name.
+    fn short(self) -> &'static str {
+        match self {
+            Self::NotSaid | Self::Other => "Search request",
+            Self::PublicData => "Data request",
+            Self::AboutThemselves => "Data subject request",
+            Self::LegalHold => "Legal hold",
+            Self::Personnel => "Personnel matter",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct About {
-    /// Short name, also used for the file name. Required.
+    pub kind: RequestKind,
+    /// Short name, also used for the file name. Optional: the kind and date stand in.
     pub name: String,
+    /// What was asked for, pasted or in the user's words.
     pub reason: String,
+    /// The Responsible Authority's own tracking number.
+    pub reference: String,
+    pub received: Option<NaiveDate>,
     pub needed_by: Option<NaiveDate>,
 }
 
@@ -477,6 +537,120 @@ pub fn looks_like_address(entry: &str) -> bool {
     }
 }
 
+/// Search details picked out of a pasted request, offered to the user as suggestions.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Found {
+    pub emails: Vec<String>,
+    /// Text in double quotes ("..." or “...”).
+    pub phrases: Vec<String>,
+    /// Every date written out in full, oldest first.
+    pub dates: Vec<NaiveDate>,
+}
+
+impl Found {
+    pub fn is_empty(&self) -> bool {
+        self.emails.is_empty() && self.phrases.is_empty() && self.dates.is_empty()
+    }
+}
+
+const MONTHS: [&str; 12] = [
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+];
+
+fn month_number(word: &str) -> Option<u32> {
+    let w = word.trim_end_matches('.').to_lowercase();
+    if w.len() < 3 {
+        return None;
+    }
+    let w = if w == "sept" { "sep".to_owned() } else { w };
+    MONTHS
+        .iter()
+        .position(|m| *m == w || (w.len() == 3 && m.starts_with(&w)))
+        .map(|i| i as u32 + 1)
+}
+
+fn numeric_date(token: &str) -> Option<NaiveDate> {
+    ["%m/%d/%Y", "%m-%d-%Y", "%Y-%m-%d"]
+        .iter()
+        .find_map(|f| NaiveDate::parse_from_str(token, f).ok())
+        .filter(|d| (1990..=2100).contains(&d.year()))
+}
+
+/// Pick out email addresses, quoted phrases and dates ("03/15/2026", "2026-03-15",
+/// "March 15, 2026", "Mar 15 2026") from text such as a pasted data request.
+pub fn find_details(text: &str) -> Found {
+    let mut found = Found::default();
+
+    let edge = |c: char| {
+        !(c.is_alphanumeric() || c == '@' || c == '/' || c == '-' || c == '_' || c == '.')
+    };
+    let words: Vec<&str> = text
+        .split(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    ',' | ';' | '<' | '>' | '(' | ')' | '[' | ']' | '"' | '“' | '”'
+                )
+        })
+        .map(|w| w.trim_matches(edge).trim_end_matches('.'))
+        .filter(|w| !w.is_empty())
+        .collect();
+
+    for w in &words {
+        if w.contains('@') && looks_like_address(w) {
+            let e = w.to_lowercase();
+            if !found.emails.contains(&e) {
+                found.emails.push(e);
+            }
+        } else if let Some(d) = numeric_date(w) {
+            found.dates.push(d);
+        }
+    }
+    // "March 15, 2026" / "Mar 15 2026"
+    for win in words.windows(3) {
+        let Some(m) = month_number(win[0]) else {
+            continue;
+        };
+        let day = win[1].trim_end_matches(|c: char| c.is_alphabetic());
+        let (Ok(day), Ok(year)) = (day.parse::<u32>(), win[2].parse::<i32>()) else {
+            continue;
+        };
+        if let Some(d) =
+            NaiveDate::from_ymd_opt(year, m, day).filter(|d| (1990..=2100).contains(&d.year()))
+        {
+            found.dates.push(d);
+        }
+    }
+    found.dates.sort();
+    found.dates.dedup();
+
+    let mut rest = text;
+    while let Some(open) = rest.find(['"', '“']) {
+        let after = &rest[open + rest[open..].chars().next().map_or(1, char::len_utf8)..];
+        let Some(close) = after.find(['"', '”']) else {
+            break;
+        };
+        let p = clean_entry(&after[..close]);
+        let fits = !p.is_empty() && p.chars().count() <= 60 && !p.contains('@');
+        if fits && !found.phrases.iter().any(|x| x.eq_ignore_ascii_case(&p)) {
+            found.phrases.push(p);
+        }
+        rest = &after[close + after[close..].chars().next().map_or(1, char::len_utf8)..];
+    }
+    found
+}
+
 fn term(raw: &str, step: Step, cx: &mut Ctx) -> Option<String> {
     let cleaned = clean_entry(raw);
     if cleaned.is_empty() {
@@ -594,14 +768,7 @@ impl SearchRequest {
         let mut include: Vec<String> = Vec::new();
         let mut exclude: Vec<String> = Vec::new();
 
-        // About / whose content (not part of the query; checked for the email).
-        if self.about.name.trim().is_empty() {
-            cx.push(
-                Level::Error,
-                Step::About,
-                "Give the request a short name. It's used for the file name.",
-            );
-        }
+        // Whose content (not part of the query; checked for the email).
         let c = &self.custodians;
         if !c.everyone && non_empty(&c.people).is_empty() && non_empty(&c.locations).is_empty() {
             cx.push(
@@ -611,7 +778,20 @@ impl SearchRequest {
             );
         }
         if !c.everyone {
-            check_people(&c.people, Step::Whose, &mut cx);
+            // Names are fine here: the IT Director looks the person up when choosing mailboxes.
+            for v in non_empty(&c.people)
+                .into_iter()
+                .filter(|v| !looks_like_address(v))
+            {
+                cx.push(
+                    Level::Info,
+                    Step::Whose,
+                    format!(
+                        "\"{v}\" is a name. That's fine: the IT Director will find their mailbox. \
+                         An email address avoids mix-ups if two people share a name."
+                    ),
+                );
+            }
         }
 
         // Words
@@ -813,16 +993,19 @@ impl SearchRequest {
         let mut out = Vec::new();
 
         let a = &self.about;
-        let mut about = vec![format!(
-            "Name: {}",
-            if a.name.trim().is_empty() {
-                "(not given)"
-            } else {
-                a.name.trim()
-            }
-        )];
+        let mut about = Vec::new();
+        if a.kind != RequestKind::NotSaid {
+            about.push(format!("Type: {}", a.kind.label()));
+        }
+        about.push(format!("Name: {}", self.display_name(today)));
+        if !a.reference.trim().is_empty() {
+            about.push(format!("Reference number: {}", a.reference.trim()));
+        }
         if !a.reason.trim().is_empty() {
-            about.push(format!("Reason: {}", a.reason.trim()));
+            about.push(format!("What was asked for: {}", a.reason.trim()));
+        }
+        if let Some(r) = a.received {
+            about.push(format!("Received {}", long_date(r)));
         }
         if let Some(n) = a.needed_by {
             about.push(format!("Needed by {}", long_date(n)));
@@ -982,6 +1165,16 @@ impl SearchRequest {
     }
 
     /// File name for the saved request, e.g. `Smith records request 2026-10-23.kql`.
+    /// The request's name, or "<kind> <date>" when none was given.
+    pub fn display_name(&self, today: NaiveDate) -> String {
+        let name = self.about.name.trim();
+        if name.is_empty() {
+            format!("{} {}", self.about.kind.short(), long_date(today))
+        } else {
+            name.to_owned()
+        }
+    }
+
     pub fn file_name(&self, today: NaiveDate) -> String {
         let safe: String = self
             .about
@@ -997,7 +1190,7 @@ impl SearchRequest {
             .collect();
         let safe = safe.split_whitespace().collect::<Vec<_>>().join(" ");
         let base = if safe.is_empty() {
-            "Search request".to_owned()
+            self.about.kind.short().to_owned()
         } else {
             safe
         };
@@ -1006,8 +1199,7 @@ impl SearchRequest {
 
     /// Subject and body for the email that goes with the file.
     pub fn email(&self, file_name: &str, today: NaiveDate) -> (String, String) {
-        let name = self.about.name.trim();
-        let subject = format!("eDiscovery search request: {name}");
+        let subject = format!("eDiscovery search request: {}", self.display_name(today));
         let mut body = String::from("Hello,\n\nPlease run the attached Purview search");
         body.push_str(&format!(" ({file_name}).\n"));
         for (step, lines) in self.describe(today) {
@@ -1029,12 +1221,47 @@ impl SearchRequest {
         (subject, body)
     }
 
+    /// A plain-text record of the request for the Responsible Authority's files: what was asked
+    /// for, the plain-English summary and the exact search that went to the IT Director.
+    pub fn record(&self, file_name: &str, query: &str, today: NaiveDate) -> String {
+        let mut out = format!(
+            "eDiscovery search request: {}\nSaved {}\nRequest file: {file_name}\n",
+            self.display_name(today),
+            long_date(today)
+        );
+        for (step, lines) in self.describe(today) {
+            let heading = match step {
+                Step::About => "Request",
+                Step::Whose => "Whose content to search",
+                Step::Words => "Words",
+                Step::When => "Dates",
+                Step::Types => "Types of items",
+                Step::Narrow => "Other filters",
+                Step::Review => continue,
+            };
+            out.push_str(&format!("\n{heading}:\n"));
+            for l in lines {
+                out.push_str(&format!("  - {l}\n"));
+            }
+        }
+        out.push_str(&format!(
+            "\nThe search, as sent in the request file (Purview KeyQL):\n{query}\n"
+        ));
+        out
+    }
+
     /// A filled-in sample request.
     pub fn example(today: NaiveDate) -> Self {
         Self {
             about: About {
+                kind: RequestKind::PublicData,
                 name: "Example - Highway 56 contract".into(),
-                reason: "Data practices request from a resident".into(),
+                reason:
+                    "All emails and documents this year between Jane Doe and Pat Lee about the \
+                         \"Highway 56\" contract, with attachments. No newsletters."
+                        .into(),
+                reference: "DR-2026-041".into(),
+                received: Some(today - Duration::days(2)),
                 needed_by: Some(today + Duration::days(10)),
             },
             custodians: Custodians {
@@ -1104,7 +1331,8 @@ mod tests {
         let b = SearchRequest::default().build_at(today());
         assert_eq!(b.query, "");
         assert!(!b.can_save());
-        assert_eq!(errors(&b).len(), 2, "{:?}", b.notices);
+        // Only "nothing to search for": the name is optional.
+        assert_eq!(errors(&b).len(), 1, "{:?}", b.notices);
         assert!(
             b.notices
                 .iter()
@@ -1332,6 +1560,64 @@ mod tests {
             "Whose content to search:\n  - People: jane.doe@example.gov and pat.lee@example.gov"
         ));
         assert!(body.contains("(x.kql)"));
+    }
+
+    #[test]
+    fn finds_details_in_a_pasted_request() {
+        let text = "Please send all emails between Jane Doe (jane.doe@example.gov) and \
+                    <pat.lee@Example.gov> about the \u{201c}Highway 56\u{201d} project or \"bid tabulation\" \
+                    from January 5, 2026 to 3/31/2026. Also Sept. 2 2025, and 2026-02-30 (not a date).";
+        let f = find_details(text);
+        assert_eq!(
+            f.emails,
+            vec!["jane.doe@example.gov", "pat.lee@example.gov"]
+        );
+        assert_eq!(f.phrases, vec!["Highway 56", "bid tabulation"]);
+        assert_eq!(f.dates, vec![d(2025, 9, 2), d(2026, 1, 5), d(2026, 3, 31)]);
+        assert!(find_details("nothing to see here").is_empty());
+        assert_eq!(find_details("on May 1st, 2026").dates, vec![d(2026, 5, 1)]);
+    }
+
+    #[test]
+    fn unnamed_requests_use_their_kind() {
+        let mut s = named();
+        s.about.name.clear();
+        s.about.kind = RequestKind::PublicData;
+        s.keywords.words = v(&["budget"]);
+        assert_eq!(s.file_name(today()), "Data request 2026-10-23.kql");
+        assert_eq!(s.display_name(today()), "Data request October 23, 2026");
+        assert!(s.build_at(today()).can_save());
+        let (subject, _) = s.email("x.kql", today());
+        assert_eq!(
+            subject,
+            "eDiscovery search request: Data request October 23, 2026"
+        );
+    }
+
+    #[test]
+    fn names_of_people_to_search_are_fine() {
+        let mut s = named();
+        s.custodians.everyone = false;
+        s.custodians.people = v(&["Jane Doe", "pat.lee@example.gov"]);
+        s.keywords.words = v(&["budget"]);
+        let b = s.build_at(today());
+        assert!(
+            b.notices.iter().all(|n| n.level == Level::Info),
+            "{:?}",
+            b.notices
+        );
+        assert_eq!(b.for_step(Step::Whose).count(), 1, "{:?}", b.notices);
+    }
+
+    #[test]
+    fn record_has_summary_and_query() {
+        let s = SearchRequest::example(today());
+        let b = s.build_at(today());
+        let r = s.record("x.kql", &b.query, today());
+        assert!(r.starts_with("eDiscovery search request: Example - Highway 56 contract\nSaved October 23, 2026\nRequest file: x.kql\n"));
+        assert!(r.contains("  - Type: Data request from the public\n"));
+        assert!(r.contains("  - Reference number: DR-2026-041\n"));
+        assert!(r.ends_with(&format!("(Purview KeyQL):\n{}\n", b.query)));
     }
 
     #[test]

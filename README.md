@@ -36,8 +36,8 @@ Staff answer a few plain-language questions. The app writes the KeyQL query for 
 ## Why
 
 Purview's search box expects KeyQL: `participants:`, `kind:`, date ranges, upper-case operators,
-quoted phrases. People who need a search (a records officer answering a data-practices request, HR,
-a department head) usually don't know it. The person who does know it ends up translating emails like
+quoted phrases. The people who need a search usually don't know it: a Responsible Authority answering a
+data practices request, HR, an attorney's office, a department head. The person who does know it ends up translating emails like
 "everything Jane sent about the Highway 56 contract this year, but not the newsletters" by hand.
 
 This app does that translation. Staff never see the query. They see a plain-English summary of
@@ -46,11 +46,16 @@ what they asked for, and whoever runs the search gets an exact, repeatable query
 ## What it does
 
 - **A seven-step wizard** with one question per page and a step list you can jump around in.
-- **Only one required answer** (a name for the request). Everything else is optional and explained in plain words.
+- **Nothing is required up front.** Every question is optional and explained in plain words. Unnamed requests are named after their type and date.
+- **Starts with the kind of request:** a data request from the public, someone asking for data about themselves, a lawsuit or legal hold, a personnel matter, or something else. Each kind gets short, practical tips on the pages where they help.
+- **Paste the request and let the app pick out the details.** Email addresses, phrases in quotes and dates (`3/31/2026`, `March 31, 2026`…) are offered as tick boxes. Nothing is added until you choose **Use these**.
+- **"Your request so far"** stays in view beside every page, in plain English, with **Change** links.
+- **Names are fine.** If you only know a person's name, type the name. The IT Director looks up the mailbox.
 - **A check-your-answers page** that summarizes the request in plain English, with **Change** links.
 - **Problems are explained, not just flagged.** Each problem has a link that takes you to the step to fix it.
 - **Saves a `.kql` file** named after the request and the date, ready to attach to an email.
 - **Writes the email for you.** It opens your mail program with the To, Subject and body filled in, or copies the text.
+- **A copy for your records.** One click saves a text file with what was asked for, the plain-English summary and the exact search.
 - **Remembers your answers** if you close the app, so a half-finished request isn't lost.
 - **Text size and color settings:** Standard, Large or Extra large text, and light, dark or match-my-computer colors.
 - **Runs anywhere:** a native app for Windows, macOS and Linux, and the same app in a browser tab via WebAssembly.
@@ -60,15 +65,17 @@ what they asked for, and whoever runs the search gets an exact, repeatable query
 | | |
 |---|---|
 | <img src="docs/screenshots/step-about.png" alt="Step 1: About this request" width="420"> | <img src="docs/screenshots/step-whose.png" alt="Step 2: Whose content" width="420"> |
-| **1. About this request.** Name the request. Optionally give a reason and a deadline. | **2. Whose content.** Work email addresses of the people to search, or shared mailboxes and sites, or "Search everyone". |
+| **1. About this request.** Pick the kind of request, paste what was asked for, and optionally add a name, a reference number, the date received and a deadline. | **2. Whose content.** Work email addresses of the people to search, or shared mailboxes and sites, or "Search everyone". |
 | <img src="docs/screenshots/step-words.png" alt="Step 3: Words to look for" width="420"> | <img src="docs/screenshots/step-dates.png" alt="Step 4: Dates" width="420"> |
 | **3. Words to look for.** Words and phrases as chips, "any" or "all", where they should appear, words to leave out, and words close together. | **4. Dates.** Any time, Last 30 days, Last 12 months, This year, Last year, or your own dates (typed as MM/DD/YYYY or picked from a calendar). |
 | <img src="docs/screenshots/step-types.png" alt="Step 5: Types of items" width="420"> | <img src="docs/screenshots/step-narrow.png" alt="Step 6: Narrow it down" width="420"> |
 | **5. Types of items.** Email, Teams chats and meetings, or files in OneDrive and SharePoint. More types are listed below. | **6. Narrow it down.** Sender and recipients, attachments, file types and names, authors, importance, size, sensitive information. |
 | <img src="docs/screenshots/review.png" alt="Step 7: Check your request" width="420"> | <img src="docs/screenshots/review-problems.png" alt="Check page with problems to fix" width="420"> |
 | **7. Check and save.** A plain-English summary of the whole request, with Change links. | **Problems block saving until they're fixed**, and warnings ask for a second look. Every one links to its step. |
-| <img src="docs/screenshots/saved.png" alt="Saved: what to do next" width="420"> | <img src="docs/screenshots/step-words-dark.png" alt="Dark colors" width="420"> |
-| **Saved.** What to do next, plus **Write the email** and **Copy email text**. | **Dark colors**, or match the computer's setting. |
+| <img src="docs/screenshots/paste-request.png" alt="Details picked out of a pasted request" width="420"> | <img src="docs/screenshots/saved.png" alt="Saved: what to do next" width="420"> |
+| **Paste the request.** The app picks out email addresses, quoted phrases and dates, and you tick the ones to use. | **Saved.** What to do next, **Write the email**, **Copy email text** and **Save a copy for my records**. |
+| <img src="docs/screenshots/step-words-dark.png" alt="Dark colors" width="420"> | |
+| **Dark colors**, or match the computer's setting. | |
 
 ## Privacy: nothing leaves your device
 
@@ -78,6 +85,7 @@ goes anywhere:
 - **No networking code.** The app makes no network requests at all. In the browser it downloads its own files once and that's it.
 - **Locked down in the browser.** The page's Content-Security-Policy only allows it to load its own files (`connect-src 'self'`), so even a future change couldn't quietly send data elsewhere.
 - **The file is made on your device.** On the desktop it's written where you choose. In the browser it's created in the tab and downloaded.
+- **Pasted requests stay local too.** Picking out addresses, phrases and dates is plain pattern matching inside the app. No AI service or server sees the text.
 - **Answers stay local.** They're saved in the app's own data folder on the desktop, or in that one browser's local storage on the web.
 - **Email stays yours.** "Write the email" only opens a `mailto:` link in your own mail program, and you attach the file yourself.
 
@@ -131,13 +139,13 @@ Rules it always follows:
 
 Saving is blocked when:
 
-- the request has no name
 - there's nothing to search for, or there are only things to leave out
 - a date can't be read
 
 You're warned (but can still save) about:
 
-- names where an email address is expected
+- no one chosen to search (no people, places or "Search everyone")
+- names in sender and recipient filters, where they go into the search itself and can match the wrong person
 - a `*` at the start of a word (Purview only supports it at the end)
 - dates in the future
 - sensitive-information filters on email (they only work on OneDrive and SharePoint files)

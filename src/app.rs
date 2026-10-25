@@ -17,7 +17,8 @@ use egui_extras::DatePickerButton;
 use serde::{Deserialize, Serialize};
 
 use crate::query::{
-    self, Attachments, DateField, DateMode, KeywordScope, Level, Near, SearchRequest, SizeOp, Step,
+    self, Attachments, DateField, DateMode, Found, KeywordScope, Level, Near, RequestKind,
+    SearchRequest, SizeOp, Step,
 };
 
 const SOURCE_URL: &str = "https://github.com/simontemplarST/keyql-builder";
@@ -57,7 +58,10 @@ fn step_question(step: Step) -> &'static str {
 }
 
 fn step_optional(step: Step) -> bool {
-    matches!(step, Step::Words | Step::When | Step::Types | Step::Narrow)
+    matches!(
+        step,
+        Step::About | Step::Words | Step::When | Step::Types | Step::Narrow
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +106,96 @@ struct Settings {
 // App state
 // ---------------------------------------------------------------------------
 
+/// Details found in a pasted request, each with a tick box.
+struct Picks {
+    found: Found,
+    emails: Vec<bool>,
+    phrases: Vec<bool>,
+    dates: bool,
+}
+
+impl Picks {
+    fn new(found: Found) -> Self {
+        Self {
+            emails: vec![true; found.emails.len()],
+            phrases: vec![true; found.phrases.len()],
+            dates: !found.dates.is_empty(),
+            found,
+        }
+    }
+
+    /// Copy the ticked details into the request. Returns a sentence saying what was added.
+    fn apply(&self, req: &mut SearchRequest, pending: &mut Pending) -> String {
+        let mut done = Vec::new();
+        let people: Vec<&String> = self
+            .found
+            .emails
+            .iter()
+            .zip(&self.emails)
+            .filter(|(_, on)| **on)
+            .map(|(e, _)| e)
+            .collect();
+        if !people.is_empty() {
+            req.custodians.everyone = false;
+            for e in &people {
+                toggle(&mut req.custodians.people, e, true);
+            }
+            done.push(count(people.len(), "person", "people") + " to search");
+        }
+        let words: Vec<&String> = self
+            .found
+            .phrases
+            .iter()
+            .zip(&self.phrases)
+            .filter(|(_, on)| **on)
+            .map(|(p, _)| p)
+            .collect();
+        if !words.is_empty() {
+            for w in &words {
+                if !req.keywords.words.iter().any(|x| x.eq_ignore_ascii_case(w)) {
+                    req.keywords.words.push((*w).clone());
+                }
+            }
+            done.push(count(words.len(), "phrase", "phrases") + " to look for");
+        }
+        if self.dates
+            && let (Some(&first), Some(&last)) = (self.found.dates.first(), self.found.dates.last())
+        {
+            let d = &mut req.dates;
+            d.start = first;
+            d.end = last;
+            d.mode = if first == last {
+                DateMode::OnOrAfter
+            } else {
+                DateMode::Between
+            };
+            pending.remove("when.start");
+            pending.remove("when.end");
+            done.push("the dates".to_owned());
+        }
+        if done.is_empty() {
+            "Nothing was ticked, so nothing was added.".to_owned()
+        } else {
+            format!(
+                "Added {}. You can check them on the next pages.",
+                plain_join(&done)
+            )
+        }
+    }
+}
+
+fn count(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+fn plain_join(parts: &[String]) -> String {
+    match parts {
+        [] => String::new(),
+        [a] => a.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
 /// Text typed into a field but not yet turned into a chip or date, keyed by field.
 type Pending = HashMap<String, String>;
 
@@ -125,6 +219,14 @@ pub struct KeyqlApp {
     show_settings: bool,
     #[serde(skip)]
     copied_at: Option<f64>,
+    /// Details found in the pasted request, waiting for the user to pick which to use.
+    #[serde(skip)]
+    picks: Option<Picks>,
+    /// What "Use these" just added, shown until the page changes.
+    #[serde(skip)]
+    picked_note: Option<String>,
+    #[serde(skip)]
+    record_note: Option<Result<String, String>>,
     #[serde(skip)]
     applied_zoom: Option<f32>,
     #[serde(skip)]
@@ -150,6 +252,7 @@ impl KeyqlApp {
         self.visited.insert(self.step);
         self.step = step;
         self.save_error = None;
+        self.picked_note = None;
     }
 
     /// Dates typed in a form the app can't read. The request keeps the last
@@ -171,6 +274,11 @@ impl KeyqlApp {
                 "about.needed_by",
                 Step::About,
                 self.req.about.needed_by.is_some(),
+            ),
+            (
+                "about.received",
+                Step::About,
+                self.req.about.received.is_some(),
             ),
         ];
         let mut out: Vec<query::Notice> = Vec::new();
@@ -271,6 +379,13 @@ impl eframe::App for KeyqlApp {
             .show(ui, |ui| self.step_list(ui, &built));
         if self.saved.is_none() {
             egui::Panel::bottom("nav").show(ui, |ui| self.nav_bar(ui));
+            // Only when there's room beside the page; the check page shows the same thing in full.
+            if ctx.content_rect().width() >= 1200.0 && self.step != Step::Review {
+                egui::Panel::right("so_far")
+                    .resizable(false)
+                    .exact_size(290.0)
+                    .show(ui, |ui| self.so_far(ui));
+            }
         }
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical()
@@ -360,6 +475,44 @@ impl KeyqlApp {
         }
     }
 
+    /// "Your request so far": the plain-English summary, kept in view while answering.
+    fn so_far(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                ui.add_space(14.0);
+                ui.label(RichText::new("Your request so far").strong());
+                ui.label(RichText::new("This updates as you answer.").small().weak());
+                ui.add_space(6.0);
+                let mut target = None;
+                for (step, lines) in self.req.describe(today()) {
+                    let empty = lines.iter().all(|l| l == "Not given");
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(step_title(step)).small().strong());
+                        if step != self.step && ui.link(RichText::new("Change").small()).clicked() {
+                            target = Some(step);
+                        }
+                    });
+                    if empty {
+                        ui.label(RichText::new("Nothing yet").small().weak());
+                        continue;
+                    }
+                    for l in lines {
+                        let l = if l.chars().count() > 140 {
+                            format!("{}…", l.chars().take(140).collect::<String>())
+                        } else {
+                            l
+                        };
+                        ui.label(RichText::new(l).small());
+                    }
+                }
+                if let Some(step) = target {
+                    self.go(step);
+                }
+            });
+    }
+
     fn step_status(&self, step: Step, built: &query::Built) -> (&'static str, &'static str) {
         let r = &self.req;
         if step == Step::Review {
@@ -374,7 +527,11 @@ impl KeyqlApp {
             return ("⛔", "Needs fixing");
         }
         let filled = match step {
-            Step::About => !r.about.name.trim().is_empty(),
+            Step::About => {
+                r.about.kind != RequestKind::NotSaid
+                    || !r.about.name.trim().is_empty()
+                    || !r.about.reason.trim().is_empty()
+            }
             Step::Whose => {
                 r.custodians.everyone
                     || !r.custodians.people.is_empty()
@@ -435,13 +592,21 @@ impl KeyqlApp {
         ui.label(RichText::new(step_question(self.step)).size(26.0).strong());
         ui.add_space(8.0);
 
+        if let Some(tip) = kind_tip(self.req.about.kind, self.step) {
+            callout(ui, "💡", "Tip for this kind of request", |ui| {
+                ui.label(tip);
+            });
+            ui.add_space(10.0);
+        }
+
         let pending = &mut self.pending;
         match self.step {
             Step::About => about_page(
                 ui,
                 &mut self.req,
-                self.visited.contains(&Step::About),
                 pending,
+                &mut self.picks,
+                &mut self.picked_note,
             ),
             Step::Whose => whose_page(ui, &mut self.req, pending),
             Step::Words => words_page(ui, &mut self.req, pending),
@@ -468,78 +633,248 @@ impl KeyqlApp {
 // Pages
 // ---------------------------------------------------------------------------
 
+/// Practical advice for the kind of request, shown at the top of a step.
+fn kind_tip(kind: RequestKind, step: Step) -> Option<&'static str> {
+    use RequestKind as K;
+    Some(match (kind, step) {
+        (K::PublicData, Step::Words) => {
+            "Use the requester's own words where you can. If they asked about \"the jail roof\", add jail roof as a phrase."
+        }
+        (K::PublicData, Step::Whose) => {
+            "If the request names people or a department, add them here. If you don't know who has the records, tick Search everyone."
+        }
+        (K::AboutThemselves, Step::Whose) => {
+            "Think about who would have written to or about this person, such as their supervisor or the department they dealt with."
+        }
+        (K::AboutThemselves, Step::Words) => {
+            "Add the person's full name and email address as words, so items that mention them are found."
+        }
+        (K::LegalHold, Step::Whose) => "List everyone named in the hold notice or by the attorney.",
+        (K::LegalHold, Step::Words) => {
+            "Legal holds often cover everything the named people have. You can leave this page empty and set only dates."
+        }
+        (K::Personnel, Step::Whose) => {
+            "Include the employee, their supervisor and anyone else involved in the matter."
+        }
+        (K::Personnel, Step::Words) => {
+            "Add the employee's full name. Words about the matter itself help narrow the results."
+        }
+        _ => return None,
+    })
+}
+
 fn about_page(
     ui: &mut egui::Ui,
     req: &mut SearchRequest,
-    show_errors: bool,
     pending: &mut Pending,
+    picks: &mut Option<Picks>,
+    picked_note: &mut Option<String>,
 ) {
     callout(ui, "ℹ", "How this works", |ui| {
+        ui.label("1. Answer a few questions. Skip anything you're not sure about.");
+        ui.label("2. Save the request file.");
+        ui.label("3. Email it to the IT Director, who runs the search and sends you the results.");
         ui.label(
-            "Answer a few short questions. Skip anything that doesn't apply. At the end you'll \
-             save a file to email to the IT Director, who runs the search in Microsoft Purview.",
+            RichText::new("You don't need to know anything about how the search works.").weak(),
         );
     });
-    ui.add_space(10.0);
+    ui.add_space(12.0);
 
     field_label(
         ui,
-        "Request name",
-        Some("Required"),
-        "A short name so you and the IT Director can tell requests apart. For example: Data request – Highway 56 project",
+        "What kind of request is this?",
+        Some("Optional"),
+        "Pick the closest one.",
     );
+    // Two columns: the cards are short, and the paste box below matters more.
+    let width = ((ui.available_width().min(780.0) - 12.0) / 2.0).max(240.0);
+    for pair in RequestKind::ALL.chunks(2) {
+        ui.horizontal_top(|ui| {
+            for &kind in pair {
+                let on = req.about.kind == kind;
+                if choice_card(
+                    ui,
+                    ("kind", kind as usize),
+                    on,
+                    kind.label(),
+                    kind.description(),
+                    true,
+                    width,
+                ) {
+                    req.about.kind = if on { RequestKind::NotSaid } else { kind };
+                }
+            }
+        });
+    }
+    ui.add_space(14.0);
+
+    field_label(
+        ui,
+        "What was asked for?",
+        Some("Optional"),
+        "Paste the request, or describe it in your own words. It's sent to the IT Director with the file.",
+    );
+    let r = ui.add(
+        egui::TextEdit::multiline(&mut req.about.reason)
+            .id(egui::Id::unique("about.reason"))
+            .hint_text("e.g. All emails between Jane Doe and the Highway Department about \"Highway 56\" since January 1, 2026")
+            .desired_rows(4)
+            .desired_width(620.0),
+    );
+    if r.changed() {
+        *picks = None;
+        *picked_note = None;
+    }
+    if !req.about.reason.trim().is_empty()
+        && picks.is_none()
+        && ui
+            .button("🔍 Pick out email addresses, phrases and dates from this")
+            .on_hover_text("Nothing is added until you say so.")
+            .clicked()
+    {
+        *picks = Some(Picks::new(query::find_details(&req.about.reason)));
+        *picked_note = None;
+    }
+    let mut close = false;
+    if let Some(p) = picks.as_mut() {
+        ui.add_space(6.0);
+        callout(ui, "🔍", "Found in what was asked for", |ui| {
+            if p.found.is_empty() {
+                ui.label(
+                    "Nothing to pick out: no email addresses, words in \"quotes\" or full dates. \
+                     You can add these on the next pages.",
+                );
+                if ui.button("OK").clicked() {
+                    close = true;
+                }
+                return;
+            }
+            ui.label(
+                RichText::new("Untick anything you don't want, then choose Use these.").weak(),
+            );
+            if !p.found.emails.is_empty() {
+                ui.label(RichText::new("People whose email, chats and files to search").strong());
+                for (e, on) in p.found.emails.iter().zip(p.emails.iter_mut()) {
+                    ui.checkbox(on, e.as_str());
+                }
+            }
+            if !p.found.phrases.is_empty() {
+                ui.label(RichText::new("Words to look for").strong());
+                for (w, on) in p.found.phrases.iter().zip(p.phrases.iter_mut()) {
+                    ui.checkbox(on, format!("\"{w}\""));
+                }
+            }
+            if let (Some(&a), Some(&b)) = (p.found.dates.first(), p.found.dates.last()) {
+                ui.label(RichText::new("Dates").strong());
+                let text = if a == b {
+                    format!("On or after {}", query::long_date(a))
+                } else {
+                    format!("From {} to {}", query::long_date(a), query::long_date(b))
+                };
+                ui.checkbox(&mut p.dates, text);
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if primary_button(ui, "Use these").clicked() {
+                    *picked_note = Some(p.apply(req, pending));
+                    close = true;
+                }
+                if ui.button("Not now").clicked() {
+                    close = true;
+                }
+            });
+        });
+    }
+    if close {
+        *picks = None;
+    }
+    if let Some(note) = picked_note.as_deref() {
+        ui.label(RichText::new(format!("✔ {note}")).color(success_color(ui)));
+    }
+    ui.add_space(14.0);
+
+    field_label(
+        ui,
+        "Name for this request",
+        Some("Optional"),
+        "A few words so you and the IT Director can tell requests apart. Leave it blank to use the suggestion.",
+    );
+    let suggested = req.display_name(today());
+    let hint = if req.about.name.is_empty() {
+        suggested
+    } else {
+        String::new()
+    };
     ui.add(
         egui::TextEdit::singleline(&mut req.about.name)
             .id(egui::Id::unique("about.name"))
-            .desired_width(520.0),
-    );
-    if show_errors && req.about.name.trim().is_empty() {
-        ui.label(RichText::new("⛔ Enter a name for the request").color(error_color(ui)));
-    }
-    ui.add_space(14.0);
-
-    field_label(
-        ui,
-        "Why is this search needed?",
-        Some("Optional"),
-        "A sentence or two of background helps the IT Director check the search finds the right things.",
-    );
-    ui.add(
-        egui::TextEdit::multiline(&mut req.about.reason)
-            .id(egui::Id::unique("about.reason"))
-            .desired_rows(3)
+            .hint_text(hint)
             .desired_width(520.0),
     );
     ui.add_space(14.0);
 
-    field_label(ui, "When do you need the results?", Some("Optional"), "");
-    let mut has_deadline = req.about.needed_by.is_some();
-    if ui
-        .checkbox(&mut has_deadline, "There's a deadline")
-        .changed()
-    {
-        req.about.needed_by = has_deadline.then(|| today() + Duration::days(7));
-    }
-    if let Some(d) = req.about.needed_by.as_mut() {
-        ui.horizontal(|ui| {
-            ui.label("Needed by");
-            date_input(ui, "about.needed_by", d, pending);
-        });
-    }
+    let a = &mut req.about;
+    let tracked = !a.reference.trim().is_empty() || a.received.is_some() || a.needed_by.is_some();
+    optional_section(ui, "Dates and reference number", tracked, |ui| {
+        field_label(
+            ui,
+            "Your reference number",
+            None,
+            "If you log requests, the number you gave this one.",
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut a.reference)
+                .id(egui::Id::unique("about.reference"))
+                .hint_text("e.g. DR-2026-041")
+                .desired_width(240.0),
+        );
+        ui.add_space(8.0);
+        let mut has = a.received.is_some();
+        if ui
+            .checkbox(&mut has, "I know when the request was received")
+            .changed()
+        {
+            a.received = has.then(today);
+        }
+        if let Some(d) = a.received.as_mut() {
+            ui.horizontal(|ui| {
+                ui.label("Received on");
+                date_input(ui, "about.received", d, pending);
+            });
+        }
+        ui.add_space(4.0);
+        let mut has = a.needed_by.is_some();
+        if ui
+            .checkbox(&mut has, "There's a deadline for the results")
+            .changed()
+        {
+            a.needed_by = has.then(|| today() + Duration::days(7));
+        }
+        if let Some(d) = a.needed_by.as_mut() {
+            ui.horizontal(|ui| {
+                ui.label("Needed by");
+                date_input(ui, "about.needed_by", d, pending);
+            });
+        }
+    });
 }
 
 fn whose_page(ui: &mut egui::Ui, req: &mut SearchRequest, pending: &mut Pending) {
     let c = &mut req.custodians;
-    ui.checkbox(&mut c.everyone, "Search everyone in the organization");
+    ui.checkbox(&mut c.everyone, "Search everyone in the organization")
+        .on_hover_text(
+            "Use this when you don't know who has the records. The search will take longer.",
+        );
     ui.add_space(8.0);
     ui.add_enabled_ui(!c.everyone, |ui| {
         field_label(
             ui,
             "People",
             None,
-            "Type a work email address and press Enter. Add as many people as you need.",
+            "Type a person's work email address, or their full name if you don't know it, and press Enter. \
+             Add as many people as you need.",
         );
-        chips(ui, "whose.people", &mut c.people, pending, "name@example.gov", Some(query::looks_like_address));
+        chips(ui, "whose.people", &mut c.people, pending, "jane.doe@example.gov or Jane Doe", None);
         ui.add_space(14.0);
         field_label(
             ui,
@@ -580,6 +915,21 @@ fn words_page(ui: &mut egui::Ui, req: &mut SearchRequest, pending: &mut Pending)
         field_label(ui, "Find items that contain", None, "");
         ui.radio_value(&mut k.match_all, false, "Any of these words (finds more)");
         ui.radio_value(&mut k.match_all, true, "All of these words (finds fewer)");
+        let first = &k.words[0];
+        let rest = k.words.len() - 1;
+        let others = if rest == 1 {
+            format!("\"{}\"", k.words[1])
+        } else {
+            "the others".to_owned()
+        };
+        ui.label(
+            RichText::new(if k.match_all {
+                format!("For example, an email that mentions \"{first}\" but not {others} will be left out.")
+            } else {
+                format!("For example, an email that mentions only \"{first}\" will be found.")
+            })
+            .weak(),
+        );
     }
     if !k.words.is_empty() {
         ui.add_space(14.0);
@@ -742,6 +1092,30 @@ fn types_page(ui: &mut egui::Ui, req: &mut SearchRequest) {
 
 fn type_card(ui: &mut egui::Ui, selected: &mut Vec<String>, t: &query::ItemType) {
     let on = selected.iter().any(|l| l == t.label);
+    if choice_card(
+        ui,
+        ("type_card", t.label),
+        on,
+        t.label,
+        t.description,
+        false,
+        490.0,
+    ) {
+        toggle(selected, t.label, !on);
+    }
+}
+
+/// A clickable card with a tick box (or a round radio mark), a title and a description.
+/// Returns true when it was clicked.
+fn choice_card(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    on: bool,
+    title: &str,
+    description: &str,
+    radio: bool,
+    width: f32,
+) -> bool {
     let visuals = ui.visuals().clone();
     let stroke = if on {
         Stroke::new(2.0, visuals.selection.stroke.color)
@@ -762,21 +1136,40 @@ fn type_card(ui: &mut egui::Ui, selected: &mut Vec<String>, t: &query::ItemType)
         .corner_radius(8)
         .inner_margin(Margin::symmetric(14, 10))
         .show(ui, |ui| {
-            ui.set_width(460.0);
+            // The frame's margin and stroke sit outside this width.
+            ui.set_width(width - 30.0);
             ui.horizontal(|ui| {
-                let mut shown = on;
                 // Drawn for show; the whole card handles the click.
-                ui.add(egui::Checkbox::without_text(&mut shown));
+                let mut shown = on;
+                if radio {
+                    ui.add(egui::RadioButton::new(shown, ""));
+                } else {
+                    ui.add(egui::Checkbox::without_text(&mut shown));
+                }
                 ui.vertical(|ui| {
-                    ui.label(RichText::new(t.label).strong());
-                    ui.label(RichText::new(t.description).weak());
+                    ui.label(RichText::new(title).strong());
+                    if !description.is_empty() {
+                        ui.label(RichText::new(description).weak());
+                    }
                 });
             });
         });
-    let id = ui.scope_id().with(("type_card", t.label));
+    let id = ui.scope_id().with(id_salt);
     let resp = ui
         .interact(frame.response.rect, id, Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand);
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(
+            if radio {
+                egui::Role::RadioButton
+            } else {
+                egui::Role::CheckBox
+            },
+            true,
+            on,
+            title,
+        )
+    });
     if resp.has_focus() {
         ui.painter().rect_stroke(
             frame.response.rect.expand(2.0),
@@ -785,10 +1178,8 @@ fn type_card(ui: &mut egui::Ui, selected: &mut Vec<String>, t: &query::ItemType)
             egui::StrokeKind::Outside,
         );
     }
-    if resp.clicked() {
-        toggle(selected, t.label, !on);
-    }
     ui.add_space(4.0);
+    resp.clicked()
 }
 
 fn narrow_page(ui: &mut egui::Ui, req: &mut SearchRequest, pending: &mut Pending) {
@@ -1057,13 +1448,11 @@ impl KeyqlApp {
             }
         });
         ui.label(
-            RichText::new(
-                if cfg!(target_arch = "wasm32") {
-                    "Your browser will download it. Next, you'll email the file to the IT Director."
-                } else {
-                    "You'll choose where to save it. Next, you'll email the file to the IT Director."
-                },
-            )
+            RichText::new(if cfg!(target_arch = "wasm32") {
+                "Your browser will download it. Next, you'll email the file to the IT Director."
+            } else {
+                "You'll choose where to save it. Next, you'll email the file to the IT Director."
+            })
             .weak(),
         );
         if let Some(e) = &self.save_error {
@@ -1109,6 +1498,7 @@ impl KeyqlApp {
             Ok(()) => {
                 self.saved = Some(path);
                 self.save_error = None;
+                self.record_note = None;
             }
             Err(e) => self.save_error = Some(e.to_string()),
         }
@@ -1123,9 +1513,57 @@ impl KeyqlApp {
             Ok(()) => {
                 self.saved = Some(PathBuf::from(name));
                 self.save_error = None;
+                self.record_note = None;
             }
             Err(e) => self.save_error = Some(e),
         }
+    }
+
+    fn record_name(&self) -> String {
+        self.req
+            .file_name(today())
+            .trim_end_matches(".kql")
+            .to_owned()
+            + " - record.txt"
+    }
+
+    fn record_text(&self, kql_file: &str) -> String {
+        self.req.record(kql_file, &self.req.build().query, today())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn save_record(&mut self, kql_file: &str, dir: Option<&std::path::Path>) {
+        let name = self.record_name();
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Save a copy for your records")
+            .set_file_name(&name)
+            .add_filter("Text file (.txt)", &["txt"]);
+        if let Some(dir) = dir {
+            dialog = dialog.set_directory(dir);
+        }
+        let test_dir = cfg!(debug_assertions)
+            .then(|| std::env::var_os("KEYQL_TEST_SAVE_DIR"))
+            .flatten();
+        let chosen = match test_dir {
+            Some(dir) => Some(PathBuf::from(dir).join(&name)),
+            None => dialog.save_file(),
+        };
+        let Some(path) = chosen else {
+            return;
+        };
+        self.record_note = Some(
+            std::fs::write(&path, self.record_text(kql_file))
+                .map(|()| format!("Saved {}", path.display()))
+                .map_err(|e| e.to_string()),
+        );
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn save_record(&mut self, kql_file: &str, _dir: Option<&std::path::Path>) {
+        let name = self.record_name();
+        self.record_note = Some(
+            download(&name, &self.record_text(kql_file)).map(|()| format!("Downloaded {name}")),
+        );
     }
 
     fn done_page(&mut self, ui: &mut egui::Ui) {
@@ -1204,6 +1642,30 @@ impl KeyqlApp {
                     .weak(),
             );
         }
+        ui.add_space(10.0);
+        ui.label(RichText::new("For your files").strong());
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .button("🗎 Save a copy for my records")
+                .on_hover_text(
+                    "A text file with what was asked for, the summary and the exact search.",
+                )
+                .clicked()
+            {
+                self.save_record(&file, path.parent());
+            }
+            match &self.record_note {
+                Some(Ok(m)) => {
+                    ui.label(RichText::new(format!("✔ {m}")).color(success_color(ui)));
+                }
+                Some(Err(e)) => {
+                    ui.label(
+                        RichText::new(format!("⛔ Couldn't save it: {e}")).color(error_color(ui)),
+                    );
+                }
+                None => {}
+            }
+        });
         ui.add_space(10.0);
         egui::CollapsingHeader::new("Show the email text").show(ui, |ui| {
             let mut text = format!("Subject: {subject}\n\n{body}");
@@ -1765,7 +2227,10 @@ fn open_link(_ctx: &egui::Context, url: &str, _new_tab: bool) {
 
 #[cfg(target_arch = "wasm32")]
 fn open_link(ctx: &egui::Context, url: &str, new_tab: bool) {
-    ctx.open_url(egui::OpenUrl { url: url.to_owned(), new_tab });
+    ctx.open_url(egui::OpenUrl {
+        url: url.to_owned(),
+        new_tab,
+    });
 }
 
 /// Hand `text` to the browser as a file download named `name`.
