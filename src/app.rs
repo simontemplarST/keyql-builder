@@ -57,6 +57,24 @@ fn step_question(step: Step) -> &'static str {
     }
 }
 
+/// A line under the question, so optional pages say so once instead of on every field.
+fn step_subtitle(step: Step) -> Option<&'static str> {
+    Some(match step {
+        Step::About => {
+            "Everything here is optional, but it helps the IT Director get the search right."
+        }
+        Step::Words => {
+            "Optional. Leave this empty to find everything that matches your other answers."
+        }
+        Step::When => {
+            "Optional. Leave it at Any time to search every date. Dates include the whole first and last day."
+        }
+        Step::Types => "Optional. Leave everything unticked to search every type.",
+        Step::Narrow => "Optional. Only use this if you need fewer, more specific results.",
+        _ => return None,
+    })
+}
+
 fn step_optional(step: Step) -> bool {
     matches!(
         step,
@@ -229,6 +247,9 @@ pub struct KeyqlApp {
     picked_note: Option<String>,
     #[serde(skip)]
     record_note: Option<Result<String, String>>,
+    /// Set when the page changes, so the next page opens at the top.
+    #[serde(skip)]
+    scroll_top: bool,
     #[serde(skip)]
     applied_zoom: Option<f32>,
     #[serde(skip)]
@@ -255,6 +276,7 @@ impl KeyqlApp {
         self.step = step;
         self.save_error = None;
         self.picked_note = None;
+        self.scroll_top = true;
     }
 
     /// Dates typed in a form the app can't read. The request keeps the last
@@ -339,11 +361,14 @@ fn setup_style(ctx: &egui::Context) {
     // field outlines >= 3:1 against the background (WCAG 1.4.3 / 1.4.11).
     ctx.style_mut_of(egui::Theme::Dark, |s| {
         s.visuals.weak_text_color = Some(Color32::from_gray(175));
+        s.visuals.hyperlink_color = Color32::from_rgb(120, 170, 245);
         s.visuals.widgets.noninteractive.fg_stroke.color = Color32::from_gray(225);
         s.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_gray(115));
     });
     ctx.style_mut_of(egui::Theme::Light, |s| {
         s.visuals.weak_text_color = Some(Color32::from_gray(80));
+        // egui's default link blue is about 3:1 on white; this one is over 6:1.
+        s.visuals.hyperlink_color = Color32::from_rgb(20, 90, 190);
         s.visuals.widgets.noninteractive.fg_stroke.color = Color32::from_gray(25);
         s.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_gray(120));
     });
@@ -381,30 +406,39 @@ impl eframe::App for KeyqlApp {
             .exact_size(250.0)
             .show(ui, |ui| self.step_list(ui, &built));
         if self.saved.is_none() {
-            egui::Panel::bottom("nav").show(ui, |ui| self.nav_bar(ui));
+            egui::Panel::bottom("nav").show(ui, |ui| self.nav_bar(ui, &built));
             // Only when there's room beside the page; the check page shows the same thing in full.
             if ctx.content_rect().width() >= 1200.0 && self.step != Step::Review {
+                // The current theme's style (the global one is the dark default).
+                let style = ui.style().clone();
                 egui::Panel::right("so_far")
                     .resizable(false)
                     .exact_size(290.0)
+                    .frame(
+                        egui::Frame::side_top_panel(&style)
+                            .fill(style.visuals.extreme_bg_color)
+                            .inner_margin(Margin::symmetric(16, 0)),
+                    )
                     .show(ui, |ui| self.so_far(ui));
             }
         }
         egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .auto_shrink(false)
-                .show(ui, |ui| {
-                    egui::Frame::new()
-                        .inner_margin(Margin::symmetric(28, 18))
-                        .show(ui, |ui| {
-                            ui.set_max_width(ui.available_width().min(780.0));
-                            if self.saved.is_some() {
-                                self.done_page(ui);
-                            } else {
-                                self.step_page(ui, &built);
-                            }
-                        });
-                });
+            let mut scroll = egui::ScrollArea::vertical().auto_shrink(false);
+            if std::mem::take(&mut self.scroll_top) {
+                scroll = scroll.vertical_scroll_offset(0.0);
+            }
+            scroll.show(ui, |ui| {
+                egui::Frame::new()
+                    .inner_margin(Margin::symmetric(28, 18))
+                    .show(ui, |ui| {
+                        ui.set_max_width(ui.available_width().min(780.0));
+                        if self.saved.is_some() {
+                            self.done_page(ui);
+                        } else {
+                            self.step_page(ui, &built);
+                        }
+                    });
+            });
         });
 
         self.reset_dialog(&ctx);
@@ -420,6 +454,7 @@ impl KeyqlApp {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
+            app_mark(ui, 26.0);
             ui.label(
                 RichText::new("eDiscovery Search Request")
                     .size(20.0)
@@ -427,13 +462,13 @@ impl KeyqlApp {
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui
-                    .button("⚙ Settings")
+                    .button("Settings")
                     .on_hover_text("Text size, colors and the IT Director's email")
                     .clicked()
                 {
                     self.show_settings = true;
                 }
-                if ui.button("🗋 Start a new request").clicked() {
+                if ui.button("Start a new request").clicked() {
                     self.confirm_reset = true;
                 }
             });
@@ -448,8 +483,8 @@ impl KeyqlApp {
         let mut target = None;
         for (i, &step) in STEPS.iter().enumerate() {
             let current = step == self.step && self.saved.is_none();
-            let (icon, status) = self.step_status(step, built);
-            if step_item(ui, i + 1, step_title(step), icon, status, current).clicked() {
+            let (state, status) = self.step_status(step, built);
+            if step_item(ui, i + 1, step_title(step), state, status, current).clicked() {
                 target = Some(step);
             }
         }
@@ -470,8 +505,8 @@ impl KeyqlApp {
         );
         ui.add_space(6.0);
         if ui
-            .link(RichText::new("Source code on GitHub ↗").small())
-            .on_hover_text(SOURCE_URL)
+            .link(RichText::new("Source code on GitHub").small())
+            .on_hover_text(format!("{SOURCE_URL} (opens in a new tab)"))
             .clicked()
         {
             open_link(ui.ctx(), SOURCE_URL, true);
@@ -483,19 +518,31 @@ impl KeyqlApp {
         egui::ScrollArea::vertical()
             .auto_shrink(false)
             .show(ui, |ui| {
-                ui.add_space(14.0);
-                ui.label(RichText::new("Your request so far").strong());
+                ui.spacing_mut().item_spacing.y = 3.0;
+                ui.add_space(16.0);
+                ui.label(RichText::new("Your request so far").size(17.0).strong());
                 ui.label(RichText::new("This updates as you answer.").small().weak());
-                ui.add_space(6.0);
+                ui.add_space(4.0);
                 let mut target = None;
                 for (step, lines) in self.req.describe(today()) {
                     let empty = lines.iter().all(|l| l == "Not given");
-                    ui.add_space(6.0);
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(2.0);
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(step_title(step)).small().strong());
-                        if step != self.step && ui.link(RichText::new("Change").small()).clicked() {
-                            target = Some(step);
-                        }
+                        let title = RichText::new(step_title(step)).small().strong();
+                        ui.label(if step == self.step {
+                            title.color(tone_color(ui, Tone::Info))
+                        } else {
+                            title
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if step != self.step
+                                && ui.link(RichText::new("Change").small()).clicked()
+                            {
+                                target = Some(step);
+                            }
+                        });
                     });
                     if empty {
                         ui.label(RichText::new("Nothing yet").small().weak());
@@ -516,18 +563,18 @@ impl KeyqlApp {
             });
     }
 
-    fn step_status(&self, step: Step, built: &query::Built) -> (&'static str, &'static str) {
+    fn step_status(&self, step: Step, built: &query::Built) -> (StepState, &'static str) {
         let r = &self.req;
         if step == Step::Review {
             return if built.can_save() {
-                ("", "Ready to save")
+                (StepState::Plain, "Ready to save")
             } else {
-                ("", "")
+                (StepState::Plain, "")
             };
         }
         let shown = self.visited.contains(&step);
         if shown && built.for_step(step).any(|n| n.level == Level::Error) {
-            return ("⛔", "Needs fixing");
+            return (StepState::Error, "Needs fixing");
         }
         let filled = match step {
             Step::About => {
@@ -553,17 +600,17 @@ impl KeyqlApp {
             Step::Review => false,
         };
         if shown && built.for_step(step).any(|n| n.level == Level::Warning) {
-            ("⚠", "Please check")
+            (StepState::Warning, "Please check")
         } else if filled {
-            ("✔", "Done")
+            (StepState::Done, "Done")
         } else if step_optional(step) {
-            ("", "Optional")
+            (StepState::Plain, "Optional")
         } else {
-            ("", "Not started")
+            (StepState::Plain, "Not started")
         }
     }
 
-    fn nav_bar(&mut self, ui: &mut egui::Ui) {
+    fn nav_bar(&mut self, ui: &mut egui::Ui, built: &query::Built) {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             let i = self.step_index();
@@ -571,6 +618,35 @@ impl KeyqlApp {
                 self.go(STEPS[i - 1]);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                // The last step's main action sits where Continue does on every other step.
+                if self.step == Step::Review {
+                    let can_save = built.can_save();
+                    let save = egui::Button::new(
+                        RichText::new("Save request file…")
+                            .size(18.0)
+                            .strong()
+                            .color(Color32::WHITE),
+                    )
+                    .fill(ACCENT)
+                    .min_size(Vec2::new(0.0, 42.0));
+                    if ui
+                        .add_enabled(can_save, save)
+                        .on_disabled_hover_text("Fix the problems listed at the top first.")
+                        .clicked()
+                    {
+                        self.save_file(built);
+                    }
+                    ui.label(
+                        RichText::new(if !can_save {
+                            "Fix the problems at the top first."
+                        } else if cfg!(target_arch = "wasm32") {
+                            "Your browser will download it."
+                        } else {
+                            "You'll choose where to save it."
+                        })
+                        .weak(),
+                    );
+                }
                 if i + 1 < STEPS.len() {
                     let label = if STEPS[i + 1] == Step::Review {
                         "Check my request →"
@@ -593,10 +669,13 @@ impl KeyqlApp {
         let i = self.step_index();
         ui.label(RichText::new(format!("Step {} of {}", i + 1, STEPS.len())).weak());
         ui.label(RichText::new(step_question(self.step)).size(26.0).strong());
-        ui.add_space(8.0);
+        if let Some(sub) = step_subtitle(self.step) {
+            ui.label(RichText::new(sub).weak());
+        }
+        ui.add_space(10.0);
 
         if let Some(tip) = kind_tip(self.req.about.kind, self.step) {
-            callout(ui, "💡", "Tip for this kind of request", |ui| {
+            callout(ui, Tone::Tip, "Tip for this kind of request", |ui| {
                 ui.label(tip);
             });
             ui.add_space(10.0);
@@ -673,10 +752,18 @@ fn about_page(
     picks: &mut Option<Picks>,
     picked_note: &mut Option<String>,
 ) {
-    callout(ui, "ℹ", "How this works", |ui| {
-        ui.label("1. Answer a few questions. Skip anything you're not sure about.");
-        ui.label("2. Save the request file.");
-        ui.label("3. Email it to the IT Director, who runs the search and sends you the results.");
+    callout(ui, Tone::Info, "How this works", |ui| {
+        numbered(
+            ui,
+            1,
+            "Answer a few questions. Skip anything you're not sure about.",
+        );
+        numbered(ui, 2, "Save the request file.");
+        numbered(
+            ui,
+            3,
+            "Email it to the IT Director, who runs the search and sends you the results.",
+        );
         ui.label(
             RichText::new("You don't need to know anything about how the search works.").weak(),
         );
@@ -686,7 +773,7 @@ fn about_page(
     field_label(
         ui,
         "What kind of request is this?",
-        Some("Optional"),
+        None,
         "Pick the closest one.",
     );
     // Two columns: the cards are short, and the paste box below matters more.
@@ -718,7 +805,7 @@ fn about_page(
     field_label(
         ui,
         "What was asked for?",
-        Some("Optional"),
+        None,
         "Paste the request, or describe it in your own words. It's sent to the IT Director with the file.",
     );
     let r = ui.add(
@@ -735,7 +822,7 @@ fn about_page(
     if !req.about.reason.trim().is_empty()
         && picks.is_none()
         && ui
-            .button("🔍 Pick out email addresses, phrases and dates from this")
+            .button("Pick out email addresses, phrases and dates from this")
             .on_hover_text("Nothing is added until you say so.")
             .clicked()
     {
@@ -745,7 +832,7 @@ fn about_page(
     let mut close = false;
     if let Some(p) = picks.as_mut() {
         ui.add_space(6.0);
-        callout(ui, "🔍", "Found in what was asked for", |ui| {
+        callout(ui, Tone::Info, "Found in what was asked for", |ui| {
             if p.found.is_empty() {
                 ui.label(
                     "Nothing to pick out: no email addresses, words in \"quotes\" or full dates. \
@@ -796,14 +883,14 @@ fn about_page(
         *picks = None;
     }
     if let Some(note) = picked_note.as_deref() {
-        ui.label(RichText::new(format!("✔ {note}")).color(success_color(ui)));
+        status_line(ui, Tone::Success, note);
     }
     ui.add_space(14.0);
 
     field_label(
         ui,
         "Name for this request",
-        Some("Optional"),
+        None,
         "A few words so you and the IT Director can tell requests apart. Leave it blank to use the suggestion.",
     );
     let suggested = req.display_name(today());
@@ -871,7 +958,7 @@ fn about_page(
 
 /// The 10-business-day deadline for someone asking for data about themselves.
 fn subject_deadline_box(ui: &mut egui::Ui, req: &mut SearchRequest, pending: &mut Pending) {
-    callout(ui, "⏱", "Minnesota deadline", |ui| {
+    callout(ui, Tone::Info, "Minnesota deadline", |ui| {
         ui.label(format!(
             "Minnesota law ({}) says to respond immediately if you can, or within {} business days \
              of the request. Weekends and legal holidays don't count.",
@@ -899,20 +986,27 @@ fn subject_deadline_box(ui: &mut egui::Ui, req: &mut SearchRequest, pending: &mu
         });
         let due = query::subject_deadline(*received, req.holidays);
         let late = due < today();
-        ui.label(
-            RichText::new(if late {
-                format!("⚠ The deadline was {}", query::weekday_date(due))
-            } else {
-                format!("Respond by {}", query::weekday_date(due))
-            })
-            .size(18.0)
-            .strong()
-            .color(if late {
-                warning_color(ui)
-            } else {
-                ui.visuals().strong_text_color()
-            }),
-        );
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            if late {
+                badge(ui, Tone::Warning, 20.0);
+            }
+            ui.label(
+                RichText::new(if late {
+                    format!("The deadline was {}", query::weekday_date(due))
+                } else {
+                    format!("Respond by {}", query::weekday_date(due))
+                })
+                .size(19.0)
+                .strong()
+                .color(if late {
+                    warning_color(ui)
+                } else {
+                    ui.visuals().strong_text_color()
+                }),
+            );
+        });
         if !late {
             let left = (1..)
                 .take_while(|&n| query::add_business_days(today(), n, req.holidays) <= due)
@@ -927,9 +1021,10 @@ fn subject_deadline_box(ui: &mut egui::Ui, req: &mut SearchRequest, pending: &mu
         if !late {
             ui.horizontal_wrapped(|ui| {
                 if a.needed_by == Some(due) {
-                    ui.label(
-                        RichText::new("✔ The IT Director will be asked for results by then.")
-                            .color(success_color(ui)),
+                    status_line(
+                        ui,
+                        Tone::Success,
+                        "The IT Director will be asked for results by then.",
                     );
                 } else if ui
                     .button("Ask the IT Director for results by then")
@@ -947,7 +1042,7 @@ fn subject_deadline_box(ui: &mut egui::Ui, req: &mut SearchRequest, pending: &mu
         ui.label(
             RichText::new(
                 "Counts Minnesota's legal holidays. If your office also closes on Indigenous Peoples Day \
-                 or the day after Thanksgiving, tick them in ⚙ Settings. This is a guide, not legal advice.",
+                 or the day after Thanksgiving, tick them in Settings (top right). This is a guide, not legal advice.",
             )
             .small()
             .weak(),
@@ -981,7 +1076,7 @@ fn whose_page(ui: &mut egui::Ui, req: &mut SearchRequest, pending: &mut Pending)
         chips(ui, "whose.locations", &mut c.locations, pending, "Highway Department shared mailbox", None);
     });
     ui.add_space(14.0);
-    callout(ui, "ℹ", "Good to know", |ui| {
+    callout(ui, Tone::Info, "Good to know", |ui| {
         ui.label(
             "This list isn't part of the search file. It's included in the email to the IT \
              Director, who chooses these mailboxes and sites in Purview.",
@@ -994,7 +1089,7 @@ fn words_page(ui: &mut egui::Ui, req: &mut SearchRequest, pending: &mut Pending)
     field_label(
         ui,
         "Words or phrases",
-        Some("Optional"),
+        None,
         "Type a word or phrase and press Enter. A phrase like snow removal is only found as those words together, in that order.",
     );
     chips(ui, "words.words", &mut k.words, pending, "budget", None);
@@ -1095,8 +1190,6 @@ fn words_page(ui: &mut egui::Ui, req: &mut SearchRequest, pending: &mut Pending)
 fn when_page(ui: &mut egui::Ui, req: &mut SearchRequest, pending: &mut Pending) {
     let d = &mut req.dates;
     let now = today();
-    ui.label(RichText::new("Dates include the whole first and last day.").weak());
-    ui.add_space(4.0);
     for mode in DateMode::ALL {
         ui.horizontal(|ui| {
             ui.radio_value(&mut d.mode, mode, mode.label());
@@ -1163,8 +1256,6 @@ fn when_page(ui: &mut egui::Ui, req: &mut SearchRequest, pending: &mut Pending) 
 }
 
 fn types_page(ui: &mut egui::Ui, req: &mut SearchRequest) {
-    ui.label(RichText::new("Leave everything unticked to search every type.").weak());
-    ui.add_space(4.0);
     for t in query::ITEM_TYPES.iter().filter(|t| t.common) {
         type_card(ui, &mut req.item_types, t);
     }
@@ -1213,8 +1304,12 @@ fn choice_card(
     width: f32,
 ) -> bool {
     let visuals = ui.visuals().clone();
+    let id = ui.scope_id().with(&id_salt);
+    let hovered = ui.ctx().read_response(id).is_some_and(|r| r.hovered());
     let stroke = if on {
         Stroke::new(2.0, visuals.selection.stroke.color)
+    } else if hovered {
+        Stroke::new(1.5, visuals.selection.stroke.color.gamma_multiply(0.8))
     } else {
         Stroke::new(
             1.0,
@@ -1250,7 +1345,6 @@ fn choice_card(
                 });
             });
         });
-    let id = ui.scope_id().with(id_salt);
     let resp = ui
         .interact(frame.response.rect, id, Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -1279,8 +1373,6 @@ fn choice_card(
 }
 
 fn narrow_page(ui: &mut egui::Ui, req: &mut SearchRequest, pending: &mut Pending) {
-    ui.label(RichText::new("Everything on this page is optional. Only use it if you need fewer, more specific results.").weak());
-    ui.add_space(6.0);
     let f = &mut req.filters;
 
     let people = !f.sent_by.is_empty() || !f.sent_to.is_empty() || !f.leave_out_people.is_empty();
@@ -1495,8 +1587,11 @@ impl KeyqlApp {
         ui.add_space(6.0);
 
         for (step, lines) in self.req.describe(today()) {
-            egui::Frame::group(ui.style())
-                .inner_margin(Margin::symmetric(14, 10))
+            egui::Frame::new()
+                .fill(ui.visuals().extreme_bg_color)
+                .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+                .corner_radius(8)
+                .inner_margin(Margin::symmetric(16, 12))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
@@ -1533,29 +1628,16 @@ impl KeyqlApp {
         }
 
         ui.add_space(16.0);
-        let can_save = built.can_save();
-        ui.horizontal(|ui| {
-            let resp = ui.add_enabled(can_save, primary(RichText::new("💾 Save request file…")));
-            if resp.clicked() {
-                self.save_file(built);
-            }
-            if !can_save {
-                ui.label(RichText::new("⛔ Fix the problems listed at the top first.").weak());
-            }
-        });
         ui.label(
-            RichText::new(if cfg!(target_arch = "wasm32") {
-                "Your browser will download it. Next, you'll email the file to the IT Director."
-            } else {
-                "You'll choose where to save it. Next, you'll email the file to the IT Director."
-            })
+            RichText::new(
+                "When everything looks right, choose Save request file at the bottom right. \
+                 Next, you'll email the file to the IT Director.",
+            )
             .weak(),
         );
         if let Some(e) = &self.save_error {
             ui.add_space(6.0);
-            ui.label(
-                RichText::new(format!("⛔ The file couldn't be saved: {e}")).color(error_color(ui)),
-            );
+            status_line(ui, Tone::Error, format!("The file couldn't be saved: {e}"));
         }
 
         if let Some(step) = target {
@@ -1678,31 +1760,48 @@ impl KeyqlApp {
                 .unwrap_or_default()
         };
 
+        let green = success_color(ui);
         egui::Frame::new()
-            .fill(success_color(ui).gamma_multiply(0.18))
-            .stroke(Stroke::new(2.0, success_color(ui)))
-            .corner_radius(8)
-            .inner_margin(Margin::same(18))
+            .fill(green.gamma_multiply(0.12))
+            .stroke(Stroke::new(2.0, green))
+            .corner_radius(10)
+            .inner_margin(Margin::same(20))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(
-                    RichText::new("✔ Your request file is saved")
-                        .size(26.0)
-                        .strong(),
-                );
-                ui.label(format!("File: {file}"));
-                ui.label(format!("Folder: {folder}"));
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 12.0;
+                    badge(ui, Tone::Success, 30.0);
+                    ui.label(
+                        RichText::new("Your request file is saved")
+                            .size(26.0)
+                            .strong()
+                            .color(ui.visuals().strong_text_color()),
+                    );
+                });
+                ui.add_space(4.0);
+                ui.label(RichText::new(&file).strong());
+                ui.label(RichText::new(format!("in {folder}")).weak());
             });
-        ui.add_space(16.0);
+        ui.add_space(20.0);
         ui.label(RichText::new("What to do next").size(20.0).strong());
-        ui.label("1. Email the file to the IT Director as an attachment.");
-        ui.label("2. The email text below lists whose content to search and what you asked for. Paste it into your email, or use Write the email.");
-        ui.label("3. The IT Director will run the search and get back to you with the results.");
+        ui.add_space(4.0);
+        numbered(ui, 1, "Email the file to the IT Director as an attachment.");
+        numbered(
+            ui,
+            2,
+            "Add the email text, which says whose content to search and what was asked for. \
+             Write the email does this for you.",
+        );
+        numbered(
+            ui,
+            3,
+            "The IT Director runs the search and gets back to you with the results.",
+        );
         ui.add_space(12.0);
 
         let (subject, body) = self.req.email(&file, today());
         ui.horizontal_wrapped(|ui| {
-            if primary_button(ui, "✉ Write the email")
+            if primary_button(ui, "Write the email")
                 .on_hover_text("Opens your email program. Remember to attach the file.")
                 .clicked()
             {
@@ -1710,7 +1809,7 @@ impl KeyqlApp {
                 open_link(ui.ctx(), &mailto(to, &subject, &body), false);
             }
             #[cfg(not(target_arch = "wasm32"))]
-            if ui.button("📂 Show the file in its folder").clicked()
+            if ui.button("Show the file in its folder").clicked()
                 && let Some(dir) = path.parent()
             {
                 let _ = open::that(dir);
@@ -1718,11 +1817,7 @@ impl KeyqlApp {
             let now = ui.input(|i| i.time);
             let copied = self.copied_at.is_some_and(|t| now - t < 2.0);
             if ui
-                .button(if copied {
-                    "✔ Copied"
-                } else {
-                    "📋 Copy email text"
-                })
+                .button(if copied { "Copied" } else { "Copy email text" })
                 .clicked()
             {
                 ui.ctx().copy_text(format!("Subject: {subject}\n\n{body}"));
@@ -1734,15 +1829,15 @@ impl KeyqlApp {
         });
         if self.settings.it_director_email.trim().is_empty() {
             ui.label(
-                RichText::new("Tip: add the IT Director's email address in ⚙ Settings to fill it in automatically.")
+                RichText::new("Tip: add the IT Director's email address in Settings (top right) to fill it in automatically.")
                     .weak(),
             );
         }
-        ui.add_space(10.0);
-        ui.label(RichText::new("For your files").strong());
+        ui.add_space(14.0);
+        ui.label(RichText::new("For your files").size(17.0).strong());
         ui.horizontal_wrapped(|ui| {
             if ui
-                .button("🗎 Save a copy for my records")
+                .button("Save a copy for my records")
                 .on_hover_text(
                     "A text file with what was asked for, the summary and the exact search.",
                 )
@@ -1751,14 +1846,8 @@ impl KeyqlApp {
                 self.save_record(&file, path.parent());
             }
             match &self.record_note {
-                Some(Ok(m)) => {
-                    ui.label(RichText::new(format!("✔ {m}")).color(success_color(ui)));
-                }
-                Some(Err(e)) => {
-                    ui.label(
-                        RichText::new(format!("⛔ Couldn't save it: {e}")).color(error_color(ui)),
-                    );
-                }
+                Some(Ok(m)) => status_line(ui, Tone::Success, m.as_str()),
+                Some(Err(e)) => status_line(ui, Tone::Error, format!("Couldn't save it: {e}")),
                 None => {}
             }
         });
@@ -1776,7 +1865,7 @@ impl KeyqlApp {
             if ui.button("← Back to my request").clicked() {
                 self.saved = None;
             }
-            if ui.button("🗋 Start a new request").clicked() {
+            if ui.button("Start a new request").clicked() {
                 self.reset();
             }
         });
@@ -1807,12 +1896,15 @@ impl KeyqlApp {
 
     fn settings_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_settings;
+        let mut close = false;
+        let frame = egui::Frame::window(&ctx.style_of(ctx.theme())).inner_margin(Margin::same(18));
         egui::Window::new("Settings")
+            .frame(frame)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_TOP, [0.0, 80.0])
-            .default_width(420.0)
+            .default_width(470.0)
             .show(ctx, |ui| {
                 field_label(
                     ui,
@@ -1863,8 +1955,12 @@ impl KeyqlApp {
                     ui.radio_value(&mut self.settings.theme, ThemeChoice::Light, "Light");
                     ui.radio_value(&mut self.settings.theme, ThemeChoice::Dark, "Dark");
                 });
+                ui.add_space(14.0);
+                if primary_button(ui, "Done").clicked() {
+                    close = true;
+                }
             });
-        self.show_settings = open;
+        self.show_settings = open && !close;
     }
 }
 
@@ -1872,12 +1968,138 @@ impl KeyqlApp {
 // Widgets
 // ---------------------------------------------------------------------------
 
-/// One row of the step list: a numbered circle (or tick), the title and a status line.
+/// What a message is about. Sets its color and the drawn badge beside it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tone {
+    Info,
+    Tip,
+    Success,
+    Warning,
+    Error,
+}
+
+impl From<Level> for Tone {
+    fn from(l: Level) -> Self {
+        match l {
+            Level::Error => Tone::Error,
+            Level::Warning => Tone::Warning,
+            Level::Info => Tone::Info,
+        }
+    }
+}
+
+const ACCENT: Color32 = Color32::from_rgb(30, 100, 200);
+
+fn tone_color(ui: &egui::Ui, tone: Tone) -> Color32 {
+    let dark = ui.visuals().dark_mode;
+    match tone {
+        Tone::Info if dark => Color32::from_rgb(120, 170, 245),
+        Tone::Info => ACCENT,
+        Tone::Tip if dark => Color32::from_rgb(230, 180, 90),
+        Tone::Tip => Color32::from_rgb(160, 100, 0),
+        Tone::Success => success_color(ui),
+        Tone::Warning => warning_color(ui),
+        Tone::Error => error_color(ui),
+    }
+}
+
+/// A round badge drawn with shapes (no emoji): i, !, a tick or a cross.
+fn paint_badge(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    tone: Tone,
+    color: Color32,
+) {
+    painter.circle_filled(center, radius, color);
+    let ink = Color32::WHITE;
+    let w = (radius * 0.2).max(1.6);
+    match tone {
+        Tone::Success => {
+            let r = radius;
+            painter.line(
+                vec![
+                    center + Vec2::new(-0.45 * r, 0.02 * r),
+                    center + Vec2::new(-0.12 * r, 0.36 * r),
+                    center + Vec2::new(0.48 * r, -0.32 * r),
+                ],
+                Stroke::new(w, ink),
+            );
+        }
+        Tone::Error => {
+            let d = radius * 0.38;
+            painter.line_segment(
+                [center + Vec2::new(-d, -d), center + Vec2::new(d, d)],
+                Stroke::new(w, ink),
+            );
+            painter.line_segment(
+                [center + Vec2::new(-d, d), center + Vec2::new(d, -d)],
+                Stroke::new(w, ink),
+            );
+        }
+        Tone::Warning => {
+            painter.line_segment(
+                [
+                    center + Vec2::new(0.0, -0.5 * radius),
+                    center + Vec2::new(0.0, 0.12 * radius),
+                ],
+                Stroke::new(w, ink),
+            );
+            painter.circle_filled(center + Vec2::new(0.0, 0.45 * radius), w * 0.6, ink);
+        }
+        Tone::Info | Tone::Tip => {
+            painter.circle_filled(center + Vec2::new(0.0, -0.45 * radius), w * 0.6, ink);
+            painter.line_segment(
+                [
+                    center + Vec2::new(0.0, -0.12 * radius),
+                    center + Vec2::new(0.0, 0.5 * radius),
+                ],
+                Stroke::new(w, ink),
+            );
+        }
+    }
+}
+
+fn badge(ui: &mut egui::Ui, tone: Tone, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    paint_badge(
+        ui.painter(),
+        rect.center(),
+        size / 2.0,
+        tone,
+        tone_color(ui, tone),
+    );
+}
+
+/// A badge and a line of text in the tone's color, wrapping as needed.
+fn status_line(ui: &mut egui::Ui, tone: Tone, text: impl Into<String>) {
+    let color = tone_color(ui, tone);
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        ui.add_space(1.0);
+        ui.vertical(|ui| {
+            ui.add_space(2.0);
+            badge(ui, tone, 16.0);
+        });
+        let text: String = text.into();
+        ui.add(egui::Label::new(RichText::new(text).color(color)).wrap());
+    });
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StepState {
+    Plain,
+    Done,
+    Warning,
+    Error,
+}
+
+/// One row of the step list: a numbered circle (or a drawn tick), the title and a status line.
 fn step_item(
     ui: &mut egui::Ui,
     number: usize,
     title: &str,
-    icon: &str,
+    state: StepState,
     status: &str,
     current: bool,
 ) -> egui::Response {
@@ -1892,14 +2114,13 @@ fn step_item(
     });
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     let v = ui.visuals().clone();
-    let accent = Color32::from_rgb(30, 100, 200);
     let painter = ui.painter();
     if current {
         painter.rect_filled(rect, 6, v.selection.bg_fill.gamma_multiply(0.35));
         painter.rect_filled(
             egui::Rect::from_min_size(rect.min, Vec2::new(4.0, rect.height())),
             2,
-            accent,
+            ACCENT,
         );
     } else if resp.hovered() {
         painter.rect_filled(rect, 6, v.widgets.hovered.weak_bg_fill);
@@ -1909,65 +2130,63 @@ fn step_item(
     }
 
     let center = rect.left_center() + Vec2::new(24.0, 0.0);
-    let done = icon == "✔";
-    let (circle_text, fill) = if done && !current {
-        ("✔".to_owned(), success_color(ui))
-    } else if current {
-        (number.to_string(), accent)
+    if state == StepState::Done && !current {
+        paint_badge(painter, center, 13.0, Tone::Success, success_color(ui));
     } else {
-        (number.to_string(), Color32::TRANSPARENT)
-    };
-    painter.circle(
-        center,
-        13.0,
-        fill,
-        Stroke::new(
-            1.5,
-            if fill == Color32::TRANSPARENT {
-                v.weak_text_color()
-            } else {
-                fill
-            },
-        ),
-    );
-    let circle_color = if fill == Color32::TRANSPARENT {
-        v.text_color()
-    } else {
-        Color32::WHITE
-    };
-    painter.text(
-        center,
-        egui::Align2::CENTER_CENTER,
-        circle_text,
-        FontId::proportional(14.0),
-        circle_color,
-    );
+        let (fill, ink) = if current {
+            (ACCENT, Color32::WHITE)
+        } else {
+            (Color32::TRANSPARENT, v.text_color())
+        };
+        painter.circle(
+            center,
+            13.0,
+            fill,
+            Stroke::new(1.5, if current { ACCENT } else { v.weak_text_color() }),
+        );
+        painter.text(
+            center,
+            egui::Align2::CENTER_CENTER,
+            number.to_string(),
+            FontId::proportional(14.0),
+            ink,
+        );
+    }
 
     let x = rect.left() + 48.0;
-    let title_font = FontId::proportional(16.0);
-    let title_color = if current {
-        v.strong_text_color()
-    } else {
-        v.text_color()
-    };
     painter.text(
         egui::pos2(x, rect.top() + 8.0),
         egui::Align2::LEFT_TOP,
         title,
-        title_font,
-        title_color,
+        FontId::proportional(16.0),
+        if current {
+            v.strong_text_color()
+        } else {
+            v.text_color()
+        },
     );
-    let (status_text, status_color) = match icon {
-        "⛔" => (format!("⛔ {status}"), error_color(ui)),
-        "⚠" => (format!("⚠ {status}"), warning_color(ui)),
-        _ => (status.to_owned(), v.weak_text_color()),
+    let (tone, color) = match state {
+        StepState::Error => (Some(Tone::Error), error_color(ui)),
+        StepState::Warning => (Some(Tone::Warning), warning_color(ui)),
+        _ => (None, v.weak_text_color()),
     };
+    let mut sx = x;
+    if let Some(tone) = tone {
+        paint_badge(
+            painter,
+            egui::pos2(x + 6.0, rect.top() + 38.0),
+            6.5,
+            tone,
+            color,
+        );
+        sx += 17.0;
+    }
     painter.text(
-        egui::pos2(x, rect.top() + 30.0),
+        egui::pos2(sx, rect.top() + 30.0),
         egui::Align2::LEFT_TOP,
-        status_text,
+        status,
         FontId::proportional(13.5),
-        status_color,
+        color,
     );
     resp
 }
@@ -1998,7 +2217,7 @@ fn success_color(ui: &egui::Ui) -> Color32 {
 
 fn primary(text: RichText) -> egui::Button<'static> {
     egui::Button::new(text.strong().color(Color32::WHITE))
-        .fill(Color32::from_rgb(30, 100, 200))
+        .fill(ACCENT)
         .min_size(Vec2::new(0.0, 36.0))
 }
 
@@ -2024,18 +2243,98 @@ fn field_label(ui: &mut egui::Ui, label: &str, tag: Option<&str>, hint: &str) {
     }
 }
 
-fn callout(ui: &mut egui::Ui, icon: &str, title: &str, body: impl FnOnce(&mut egui::Ui)) {
-    let accent = ui.visuals().selection.stroke.color;
-    egui::Frame::new()
-        .fill(ui.visuals().faint_bg_color)
-        .stroke(Stroke::new(1.0, accent.gamma_multiply(0.6)))
-        .corner_radius(6)
-        .inner_margin(Margin::symmetric(14, 10))
+/// The page-and-magnifier mark from the loading screen, drawn with shapes.
+fn app_mark(ui: &mut egui::Ui, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    let p = ui.painter();
+    let u = size / 76.0; // the loading screen's SVG is 76 units wide
+    let at = |x: f32, y: f32| rect.min + Vec2::new(x * u, y * u);
+    let ink = ui.visuals().weak_text_color();
+    let accent = tone_color(ui, Tone::Info);
+    p.rect(
+        egui::Rect::from_min_max(at(12.0, 8.0), at(52.0, 60.0)),
+        5.0 * u,
+        ui.visuals().extreme_bg_color,
+        Stroke::new(2.5 * u, ink),
+        egui::StrokeKind::Middle,
+    );
+    for (y, w) in [(19.0, 26.0), (28.0, 20.0), (37.0, 24.0)] {
+        p.rect_filled(
+            egui::Rect::from_min_size(at(19.0, y), Vec2::new(w, 3.5) * u),
+            1.75 * u,
+            ink,
+        );
+    }
+    p.circle(
+        at(42.0, 40.0),
+        12.0 * u,
+        accent.gamma_multiply(0.25),
+        Stroke::new(3.5 * u, accent),
+    );
+    p.line_segment(
+        [at(51.0, 49.0), at(62.0, 60.0)],
+        Stroke::new(5.0 * u, accent),
+    );
+}
+
+/// "1  Text" with the number in a small circle, for short lists of steps.
+fn numbered(ui: &mut egui::Ui, n: usize, text: &str) {
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 10.0;
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
+        let color = ui.visuals().weak_text_color();
+        ui.painter()
+            .circle_stroke(rect.center(), 10.0, Stroke::new(1.3, color));
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            n.to_string(),
+            FontId::proportional(13.0),
+            ui.visuals().text_color(),
+        );
+        ui.add(egui::Label::new(text).wrap());
+    });
+}
+
+/// A tinted box with a colored edge, a badge and a title.
+fn callout(ui: &mut egui::Ui, tone: Tone, title: &str, body: impl FnOnce(&mut egui::Ui)) {
+    let color = tone_color(ui, tone);
+    let tint = if ui.visuals().dark_mode { 0.10 } else { 0.07 };
+    let inner = egui::Frame::new()
+        .fill(color.gamma_multiply(tint))
+        .stroke(Stroke::new(1.0, color.gamma_multiply(0.35)))
+        .corner_radius(8)
+        .inner_margin(Margin {
+            left: 20,
+            right: 14,
+            top: 10,
+            bottom: 12,
+        })
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new(format!("{icon} {title}")).strong());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                badge(ui, tone, 18.0);
+                ui.label(
+                    RichText::new(title)
+                        .strong()
+                        .color(ui.visuals().strong_text_color()),
+                );
+            });
+            ui.add_space(2.0);
             body(ui);
         });
+    let r = inner.response.rect;
+    ui.painter().rect_filled(
+        egui::Rect::from_min_size(r.min, Vec2::new(4.0, r.height())),
+        egui::CornerRadius {
+            nw: 8,
+            sw: 8,
+            ne: 0,
+            se: 0,
+        },
+        color,
+    );
 }
 
 fn optional_section(
@@ -2044,12 +2343,21 @@ fn optional_section(
     has_content: bool,
     body: impl FnOnce(&mut egui::Ui),
 ) {
-    let text = if has_content {
-        RichText::new(format!("{title}  ✔")).strong()
-    } else {
-        RichText::new(title).strong()
-    };
-    egui::CollapsingHeader::new(text)
+    let mut job = egui::text::LayoutJob::default();
+    let body_font = FontId::proportional(16.0);
+    job.append(
+        title,
+        0.0,
+        egui::TextFormat::simple(body_font.clone(), ui.visuals().strong_text_color()),
+    );
+    if has_content {
+        job.append(
+            "filled in",
+            10.0,
+            egui::TextFormat::simple(FontId::proportional(13.5), success_color(ui)),
+        );
+    }
+    egui::CollapsingHeader::new(job)
         .id_salt(title)
         .default_open(has_content)
         .show(ui, |ui| {
@@ -2061,18 +2369,24 @@ fn optional_section(
 
 fn notice_box(ui: &mut egui::Ui, notices: &[query::Notice]) {
     for n in notices {
-        let (icon, color) = match n.level {
-            Level::Error => ("⛔", error_color(ui)),
-            Level::Warning => ("⚠", warning_color(ui)),
-            Level::Info => ("ℹ", ui.visuals().text_color()),
-        };
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(icon).color(color));
-            ui.label(&n.message);
-        });
+        let tone = Tone::from(n.level);
+        if tone == Tone::Info {
+            // Notes read as plain text with a badge; only problems take a color.
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.vertical(|ui| {
+                    ui.add_space(2.0);
+                    badge(ui, tone, 16.0);
+                });
+                ui.add(egui::Label::new(&n.message).wrap());
+            });
+        } else {
+            status_line(ui, tone, &n.message);
+        }
     }
 }
 
+/// The error summary on the check page: each problem is a link to the step that fixes it.
 fn problem_box(
     ui: &mut egui::Ui,
     level: Level,
@@ -2080,33 +2394,31 @@ fn problem_box(
     notices: &[query::Notice],
     target: &mut Option<Step>,
 ) {
-    let (icon, color) = match level {
-        Level::Error => ("⛔", error_color(ui)),
-        _ => ("⚠", warning_color(ui)),
-    };
+    let tone = Tone::from(level);
+    let color = tone_color(ui, tone);
     egui::Frame::new()
         .stroke(Stroke::new(3.0, color))
-        .corner_radius(6)
-        .inner_margin(Margin::symmetric(14, 10))
+        .fill(color.gamma_multiply(0.05))
+        .corner_radius(8)
+        .inner_margin(Margin::symmetric(16, 12))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(
-                RichText::new(format!("{icon} {title}"))
-                    .size(18.0)
-                    .strong()
-                    .color(color),
-            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                badge(ui, tone, 20.0);
+                ui.label(RichText::new(title).size(18.0).strong().color(color));
+            });
+            ui.add_space(2.0);
             for n in notices {
-                ui.horizontal_wrapped(|ui| {
+                if n.step == Step::Review {
                     ui.label(format!("• {}", n.message));
-                    if n.step != Step::Review
-                        && ui
-                            .link(format!("Go to {}", step_title(n.step).to_lowercase()))
-                            .clicked()
-                    {
-                        *target = Some(n.step);
-                    }
-                });
+                } else if ui
+                    .link(format!("• {}", n.message))
+                    .on_hover_text(format!("Go to {}", step_title(n.step)))
+                    .clicked()
+                {
+                    *target = Some(n.step);
+                }
             }
         });
 }
@@ -2183,36 +2495,39 @@ fn chips(
         ui.horizontal_wrapped(|ui| {
             for (i, item) in items.iter().enumerate() {
                 let bad = check.is_some_and(|f| !f(item));
-                let stroke = if bad {
-                    Stroke::new(1.5, warning_color(ui))
+                let (fill, stroke) = if bad {
+                    (
+                        warning_color(ui).gamma_multiply(0.10),
+                        Stroke::new(1.5, warning_color(ui)),
+                    )
                 } else {
-                    Stroke::new(
-                        1.0,
-                        ui.visuals()
-                            .widgets
-                            .inactive
-                            .bg_stroke
-                            .color
-                            .gamma_multiply(2.0),
+                    (
+                        ACCENT.gamma_multiply(if ui.visuals().dark_mode { 0.22 } else { 0.08 }),
+                        Stroke::new(1.0, ACCENT.gamma_multiply(0.45)),
                     )
                 };
                 egui::Frame::new()
-                    .fill(ui.visuals().faint_bg_color)
+                    .fill(fill)
                     .stroke(stroke)
-                    .corner_radius(14)
-                    .inner_margin(Margin::symmetric(10, 3))
+                    .corner_radius(16)
+                    .inner_margin(Margin {
+                        left: 12,
+                        right: 4,
+                        top: 3,
+                        bottom: 3,
+                    })
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
                             if bad {
-                                ui.label(RichText::new("⚠").color(warning_color(ui)))
-                                    .on_hover_text("This doesn't look like a full email address.");
+                                badge(ui, Tone::Warning, 14.0);
                             }
-                            ui.label(item);
-                            if ui
-                                .small_button("✖")
-                                .on_hover_text(format!("Remove {item}"))
-                                .clicked()
-                            {
+                            ui.label(RichText::new(item).color(ui.visuals().strong_text_color()));
+                            let x = egui::Button::new(RichText::new("×").size(18.0))
+                                .frame_when_inactive(false)
+                                .corner_radius(12)
+                                .min_size(Vec2::splat(24.0));
+                            if ui.add(x).on_hover_text(format!("Remove {item}")).clicked() {
                                 remove = Some(i);
                             }
                         });
@@ -2226,13 +2541,14 @@ fn chips(
     if let Some(f) = check {
         let bad: Vec<&str> = items.iter().filter(|i| !f(i)).map(String::as_str).collect();
         if !bad.is_empty() {
-            ui.label(
-                RichText::new(format!(
-                    "⚠ {} {} not a full email address. Names can match the wrong person.",
+            status_line(
+                ui,
+                Tone::Warning,
+                format!(
+                    "{} {} not a full email address. Names can match the wrong person.",
                     bad.join(", "),
                     if bad.len() == 1 { "is" } else { "are" }
-                ))
-                .color(warning_color(ui)),
+                ),
             );
         }
     }
@@ -2302,9 +2618,10 @@ fn date_input(ui: &mut egui::Ui, key: &str, date: &mut NaiveDate, pending: &mut 
         *text = us_date(*date);
     }
     if parsed.is_none() && !r.has_focus() {
-        ui.label(
-            RichText::new("⚠ Type the date as MM/DD/YYYY, for example 03/15/2026")
-                .color(warning_color(ui)),
+        status_line(
+            ui,
+            Tone::Warning,
+            "Type the date as MM/DD/YYYY, for example 03/15/2026",
         );
     }
 }

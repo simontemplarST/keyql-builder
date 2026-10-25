@@ -72,7 +72,7 @@ what they asked for, and whoever runs the search gets an exact, repeatable query
 | <img src="docs/screenshots/step-types.png" alt="Step 5: Types of items" width="420"> | <img src="docs/screenshots/step-narrow.png" alt="Step 6: Narrow it down" width="420"> |
 | **5. Types of items.** Email, Teams chats and meetings, or files in OneDrive and SharePoint. More types are listed below. | **6. Narrow it down.** Sender and recipients, attachments, file types and names, authors, importance, size, sensitive information. |
 | <img src="docs/screenshots/review.png" alt="Step 7: Check your request" width="420"> | <img src="docs/screenshots/review-problems.png" alt="Check page with problems to fix" width="420"> |
-| **7. Check and save.** A plain-English summary of the whole request, with Change links. | **Problems block saving until they're fixed**, and warnings ask for a second look. Every one links to its step. |
+| **7. Check and save.** A plain-English summary of the whole request, with Change links, and **Save request file…** at the bottom right, where Continue is on every other step. | **Problems block saving until they're fixed**, and warnings ask for a second look. Every one links to its step. |
 | <img src="docs/screenshots/paste-request.png" alt="Details picked out of a pasted request" width="420"> | <img src="docs/screenshots/saved.png" alt="Saved: what to do next" width="420"> |
 | **Paste the request.** The app picks out email addresses, quoted phrases and dates, and you tick the ones to use. | **Saved.** What to do next, **Write the email**, **Copy email text** and **Save a copy for my records**. |
 | <img src="docs/screenshots/step-words-dark.png" alt="Dark colors" width="420"> | |
