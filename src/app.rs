@@ -20,6 +20,8 @@ use crate::query::{
     self, Attachments, DateField, DateMode, KeywordScope, Level, Near, SearchRequest, SizeOp, Step,
 };
 
+const SOURCE_URL: &str = "https://github.com/simontemplarST/keyql-builder";
+
 const STEPS: [Step; 7] = [
     Step::About,
     Step::Whose,
@@ -348,6 +350,14 @@ impl KeyqlApp {
                 .small()
                 .weak(),
         );
+        ui.add_space(6.0);
+        if ui
+            .link(RichText::new("Source code on GitHub ↗").small())
+            .on_hover_text(SOURCE_URL)
+            .clicked()
+        {
+            open_link(ui.ctx(), SOURCE_URL, true);
+        }
     }
 
     fn step_status(&self, step: Step, built: &query::Built) -> (&'static str, &'static str) {
@@ -1163,7 +1173,7 @@ impl KeyqlApp {
                 .clicked()
             {
                 let to = self.settings.it_director_email.trim();
-                open_link(ui.ctx(), &mailto(to, &subject, &body));
+                open_link(ui.ctx(), &mailto(to, &subject, &body), false);
             }
             #[cfg(not(target_arch = "wasm32"))]
             if ui.button("📂 Show the file in its folder").clicked()
@@ -1749,13 +1759,13 @@ fn simple_date(ui: &mut egui::Ui, key: &str, date: &mut NaiveDate) -> bool {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn open_link(_ctx: &egui::Context, url: &str) {
+fn open_link(_ctx: &egui::Context, url: &str, _new_tab: bool) {
     let _ = open::that(url);
 }
 
 #[cfg(target_arch = "wasm32")]
-fn open_link(ctx: &egui::Context, url: &str) {
-    ctx.open_url(egui::OpenUrl::same_tab(url));
+fn open_link(ctx: &egui::Context, url: &str, new_tab: bool) {
+    ctx.open_url(egui::OpenUrl { url: url.to_owned(), new_tab });
 }
 
 /// Hand `text` to the browser as a file download named `name`.
