@@ -49,6 +49,7 @@ what they asked for, and whoever runs the search gets an exact, repeatable query
 - **Nothing is required up front.** Every question is optional and explained in plain words. Unnamed requests are named after their type and date.
 - **Starts with the kind of request:** a data request from the public, someone asking for data about themselves, a lawsuit or legal hold, a personnel matter, or something else. Each kind gets short, practical tips on the pages where they help.
 - **Paste the request and let the app pick out the details.** Email addresses, phrases in quotes and dates (`3/31/2026`, `March 31, 2026`…) are offered as tick boxes. Nothing is added until you choose **Use these**.
+- **The Minnesota deadline, worked out for you.** For someone asking for data about themselves, enter the date the request came in and the app shows the date to respond by (see [below](#the-minnesota-10-business-day-deadline)).
 - **"Your request so far"** stays in view beside every page, in plain English, with **Change** links.
 - **Names are fine.** If you only know a person's name, type the name. The IT Director looks up the mailbox.
 - **A check-your-answers page** that summarizes the request in plain English, with **Change** links.
@@ -134,6 +135,28 @@ Rules it always follows:
 - Operators are upper case (`AND`, `OR`, `NOT`, `NEAR(n)`).
 - Several values in one condition are joined with `OR`, and conditions are joined with `AND`.
 - Dates are **absolute**. "Last 30 days" is fixed on the day the file is saved, so the same search can be run again later and give the same results.
+
+## The Minnesota 10-business-day deadline
+
+When the request is from **someone asking for data about themselves**, the app works out the response deadline
+under [Minn. Stat. § 13.04, subd. 3](https://www.revisor.mn.gov/statutes/cite/13.04): comply immediately if
+possible, or within ten days of the request, excluding Saturdays, Sundays and legal holidays.
+
+- **Day one is the next business day** after the request was received, so a request received on Friday,
+  October 23, 2026 is due Friday, November 6, 2026.
+- **Legal holidays** are those in [Minn. Stat. § 645.44, subd. 5](https://www.revisor.mn.gov/statutes/cite/645.44):
+  New Year's Day, Martin Luther King's Birthday, Washington's and Lincoln's Birthday, Memorial Day, Juneteenth,
+  Independence Day, Labor Day, Veterans Day, Thanksgiving and Christmas. When New Year's Day, Juneteenth,
+  Independence Day, Veterans Day or Christmas falls on a Saturday it's observed on Friday, and on a Sunday it's
+  observed on Monday.
+- **Indigenous Peoples Day and the Friday after Thanksgiving** are holidays only if the office chooses to observe
+  them, so they're counted as workdays (the earlier, safer deadline) unless you tick them in **Settings**.
+- The deadline appears on the first page, in "Your request so far", in the email to the IT Director and in the
+  copy for your records. **Ask the IT Director for results by then** sets it as the deadline for results.
+- You're warned when the deadline has passed, or when results are asked for after it.
+
+This is a guide, not legal advice. Public data requests under § 13.03 have no fixed number of days, so no deadline
+is shown for them.
 
 ## Checks
 

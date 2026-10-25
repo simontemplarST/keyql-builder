@@ -17,8 +17,8 @@ use egui_extras::DatePickerButton;
 use serde::{Deserialize, Serialize};
 
 use crate::query::{
-    self, Attachments, DateField, DateMode, Found, KeywordScope, Level, Near, RequestKind,
-    SearchRequest, SizeOp, Step,
+    self, Attachments, DateField, DateMode, Found, KeywordScope, Level, Near, OptionalHolidays,
+    RequestKind, SearchRequest, SizeOp, Step,
 };
 
 const SOURCE_URL: &str = "https://github.com/simontemplarST/keyql-builder";
@@ -100,6 +100,8 @@ struct Settings {
     it_director_email: String,
     text_size: TextSize,
     theme: ThemeChoice,
+    /// Holidays the office observes beyond the ones every Minnesota government closes for.
+    holidays: OptionalHolidays,
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +371,7 @@ impl eframe::App for KeyqlApp {
             self.applied_theme = Some(self.settings.theme);
         }
 
+        self.req.holidays = self.settings.holidays;
         let mut built = self.req.build();
         built.notices.extend(self.date_problems());
 
@@ -706,6 +709,10 @@ fn about_page(
             }
         });
     }
+    if req.about.kind == RequestKind::AboutThemselves {
+        ui.add_space(6.0);
+        subject_deadline_box(ui, req, pending);
+    }
     ui.add_space(14.0);
 
     field_label(
@@ -829,18 +836,21 @@ fn about_page(
                 .desired_width(240.0),
         );
         ui.add_space(8.0);
-        let mut has = a.received.is_some();
-        if ui
-            .checkbox(&mut has, "I know when the request was received")
-            .changed()
-        {
-            a.received = has.then(today);
-        }
-        if let Some(d) = a.received.as_mut() {
-            ui.horizontal(|ui| {
-                ui.label("Received on");
-                date_input(ui, "about.received", d, pending);
-            });
+        // For a data subject's request the date received is asked in the deadline box above.
+        if a.kind != RequestKind::AboutThemselves {
+            let mut has = a.received.is_some();
+            if ui
+                .checkbox(&mut has, "I know when the request was received")
+                .changed()
+            {
+                a.received = has.then(today);
+            }
+            if let Some(d) = a.received.as_mut() {
+                ui.horizontal(|ui| {
+                    ui.label("Received on");
+                    date_input(ui, "about.received", d, pending);
+                });
+            }
         }
         ui.add_space(4.0);
         let mut has = a.needed_by.is_some();
@@ -856,6 +866,92 @@ fn about_page(
                 date_input(ui, "about.needed_by", d, pending);
             });
         }
+    });
+}
+
+/// The 10-business-day deadline for someone asking for data about themselves.
+fn subject_deadline_box(ui: &mut egui::Ui, req: &mut SearchRequest, pending: &mut Pending) {
+    callout(ui, "⏱", "Minnesota deadline", |ui| {
+        ui.label(format!(
+            "Minnesota law ({}) says to respond immediately if you can, or within {} business days \
+             of the request. Weekends and legal holidays don't count.",
+            query::SUBJECT_CITATION,
+            query::SUBJECT_DAYS
+        ));
+        ui.add_space(4.0);
+        let a = &mut req.about;
+        let Some(received) = a.received.as_mut() else {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("When was the request received?").strong());
+                if primary_button(ui, "Today").clicked() {
+                    a.received = Some(today());
+                }
+                if ui.button("Another day…").clicked() {
+                    a.received = Some(today());
+                    pending.insert("about.received".into(), String::new());
+                }
+            });
+            return;
+        };
+        ui.horizontal(|ui| {
+            ui.label("Received on");
+            date_input(ui, "about.received", received, pending);
+        });
+        let due = query::subject_deadline(*received, req.holidays);
+        let late = due < today();
+        ui.label(
+            RichText::new(if late {
+                format!("⚠ The deadline was {}", query::weekday_date(due))
+            } else {
+                format!("Respond by {}", query::weekday_date(due))
+            })
+            .size(18.0)
+            .strong()
+            .color(if late {
+                warning_color(ui)
+            } else {
+                ui.visuals().strong_text_color()
+            }),
+        );
+        if !late {
+            let left = (1..)
+                .take_while(|&n| query::add_business_days(today(), n, req.holidays) <= due)
+                .count();
+            ui.label(match left {
+                0 => "That's today.".to_owned(),
+                1 => "That's 1 business day from today.".to_owned(),
+                n => format!("That's {n} business days from today."),
+            });
+        }
+        let a = &mut req.about;
+        if !late {
+            ui.horizontal_wrapped(|ui| {
+                if a.needed_by == Some(due) {
+                    ui.label(
+                        RichText::new("✔ The IT Director will be asked for results by then.")
+                            .color(success_color(ui)),
+                    );
+                } else if ui
+                    .button("Ask the IT Director for results by then")
+                    .clicked()
+                {
+                    a.needed_by = Some(due);
+                    pending.remove("about.needed_by");
+                }
+            });
+            ui.label(
+                RichText::new("Leave yourself time to review the results before you respond.")
+                    .weak(),
+            );
+        }
+        ui.label(
+            RichText::new(
+                "Counts Minnesota's legal holidays. If your office also closes on Indigenous Peoples Day \
+                 or the day after Thanksgiving, tick them in ⚙ Settings. This is a guide, not legal advice.",
+            )
+            .small()
+            .weak(),
+        );
     });
 }
 
@@ -1728,6 +1824,22 @@ impl KeyqlApp {
                     egui::TextEdit::singleline(&mut self.settings.it_director_email)
                         .hint_text("it.director@example.gov")
                         .desired_width(360.0),
+                );
+                ui.add_space(10.0);
+                field_label(
+                    ui,
+                    "Office holidays",
+                    None,
+                    "Minnesota lets each office choose whether these are holidays. Tick the ones yours \
+                     closes for, and they're skipped when counting the 10 business days.",
+                );
+                ui.checkbox(
+                    &mut self.settings.holidays.indigenous_peoples_day,
+                    "Indigenous Peoples Day (second Monday in October)",
+                );
+                ui.checkbox(
+                    &mut self.settings.holidays.day_after_thanksgiving,
+                    "The Friday after Thanksgiving",
                 );
                 ui.add_space(10.0);
                 field_label(ui, "Text size", None, "");

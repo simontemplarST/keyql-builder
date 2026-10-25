@@ -14,7 +14,7 @@
 //! - Only suffix wildcards (`budg*`) are supported.
 //! - KeyQL has no comments, so request details never go into the query.
 
-use chrono::{Datelike, Duration, NaiveDate};
+use chrono::{Datelike, Duration, NaiveDate, Weekday};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -442,6 +442,107 @@ pub struct SearchRequest {
     /// Labels from `ITEM_TYPES`. Empty means every type.
     pub item_types: Vec<String>,
     pub filters: Filters,
+    /// The office's optional holidays, copied in from the app's settings (not part of the request).
+    #[serde(skip)]
+    pub holidays: OptionalHolidays,
+}
+
+// ---------------------------------------------------------------------------
+// Minnesota deadline for a data subject's request
+// ---------------------------------------------------------------------------
+
+/// Minn. Stat. § 13.04, subd. 3: comply immediately if possible, or within ten days of the request,
+/// excluding Saturdays, Sundays and legal holidays.
+pub const SUBJECT_DAYS: u32 = 10;
+pub const SUBJECT_CITATION: &str = "Minn. Stat. § 13.04, subd. 3";
+
+/// Holidays Minn. Stat. § 645.44, subd. 5 lets local governments choose to observe.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OptionalHolidays {
+    pub indigenous_peoples_day: bool,
+    pub day_after_thanksgiving: bool,
+}
+
+fn nth_weekday(year: i32, month: u32, day: Weekday, n: u8) -> Option<NaiveDate> {
+    NaiveDate::from_weekday_of_month_opt(year, month, day, n)
+}
+
+fn last_weekday(year: i32, month: u32, day: Weekday) -> Option<NaiveDate> {
+    (1..=5u8)
+        .rev()
+        .find_map(|n| nth_weekday(year, month, day, n))
+}
+
+/// Legal holidays under Minn. Stat. § 645.44, subd. 5 for one year, with the fixed-date ones
+/// moved to Friday or Monday when they fall on a weekend.
+pub fn mn_holidays(year: i32, opt: OptionalHolidays) -> Vec<NaiveDate> {
+    let fixed = |m: u32, d: u32| NaiveDate::from_ymd_opt(year, m, d);
+    let mut out = Vec::new();
+    // New Year's Day, Juneteenth, Independence Day, Veterans Day and Christmas: Sunday -> Monday,
+    // Saturday -> Friday (the Friday may fall in the year before, for New Year's Day).
+    for d in [
+        fixed(1, 1),
+        fixed(6, 19),
+        fixed(7, 4),
+        fixed(11, 11),
+        fixed(12, 25),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        out.push(match d.weekday() {
+            Weekday::Sat => d - Duration::days(1),
+            Weekday::Sun => d + Duration::days(1),
+            _ => d,
+        });
+    }
+    let thanksgiving = nth_weekday(year, 11, Weekday::Thu, 4);
+    out.extend(
+        [
+            nth_weekday(year, 1, Weekday::Mon, 3), // Martin Luther King's Birthday
+            nth_weekday(year, 2, Weekday::Mon, 3), // Washington's and Lincoln's Birthday
+            last_weekday(year, 5, Weekday::Mon),   // Memorial Day
+            nth_weekday(year, 9, Weekday::Mon, 1), // Labor Day
+            thanksgiving,
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    if opt.indigenous_peoples_day {
+        out.extend(nth_weekday(year, 10, Weekday::Mon, 2));
+    }
+    if opt.day_after_thanksgiving {
+        out.extend(thanksgiving.map(|t| t + Duration::days(1)));
+    }
+    out.sort();
+    out
+}
+
+pub fn is_business_day(d: NaiveDate, opt: OptionalHolidays) -> bool {
+    !matches!(d.weekday(), Weekday::Sat | Weekday::Sun)
+        // An observed New Year's Day can fall in the year before, so check next year's list too.
+        && ![d.year(), d.year() + 1]
+            .iter()
+            .any(|&y| mn_holidays(y, opt).contains(&d))
+}
+
+/// The date `n` business days after `start` (day one is the next business day).
+pub fn add_business_days(start: NaiveDate, n: u32, opt: OptionalHolidays) -> NaiveDate {
+    let mut d = start;
+    let mut left = n;
+    while left > 0 {
+        d += Duration::days(1);
+        if is_business_day(d, opt) {
+            left -= 1;
+        }
+    }
+    d
+}
+
+/// The last day to respond to a person asking for data about themselves.
+pub fn subject_deadline(received: NaiveDate, opt: OptionalHolidays) -> NaiveDate {
+    add_business_days(received, SUBJECT_DAYS, opt)
 }
 
 // ---------------------------------------------------------------------------
@@ -727,6 +828,11 @@ pub fn long_date(d: NaiveDate) -> String {
     d.format("%B %-d, %Y").to_string()
 }
 
+/// "Thursday, March 5, 2026"
+pub fn weekday_date(d: NaiveDate) -> String {
+    d.format("%A, %B %-d, %Y").to_string()
+}
+
 fn non_empty(values: &[String]) -> Vec<String> {
     values
         .iter()
@@ -767,6 +873,40 @@ impl SearchRequest {
         };
         let mut include: Vec<String> = Vec::new();
         let mut exclude: Vec<String> = Vec::new();
+
+        // The Minnesota deadline for someone asking for data about themselves.
+        let a = &self.about;
+        if a.kind == RequestKind::AboutThemselves {
+            match a.received {
+                None => cx.push(
+                    Level::Info,
+                    Step::About,
+                    "Add the date the request was received to work out the 10-business-day deadline.",
+                ),
+                Some(r) => {
+                    let due = subject_deadline(r, self.holidays);
+                    if due < today {
+                        cx.push(
+                            Level::Warning,
+                            Step::About,
+                            format!(
+                                "The deadline to respond was {}. Respond as soon as you can.",
+                                weekday_date(due)
+                            ),
+                        );
+                    } else if a.needed_by.is_some_and(|n| n > due) {
+                        cx.push(
+                            Level::Warning,
+                            Step::About,
+                            format!(
+                                "The results are asked for after the deadline to respond ({}).",
+                                weekday_date(due)
+                            ),
+                        );
+                    }
+                }
+            }
+        }
 
         // Whose content (not part of the query; checked for the email).
         let c = &self.custodians;
@@ -1006,6 +1146,12 @@ impl SearchRequest {
         }
         if let Some(r) = a.received {
             about.push(format!("Received {}", long_date(r)));
+            if a.kind == RequestKind::AboutThemselves {
+                about.push(format!(
+                    "Minnesota deadline to respond: {} ({SUBJECT_DAYS} business days, {SUBJECT_CITATION})",
+                    weekday_date(subject_deadline(r, self.holidays))
+                ));
+            }
         }
         if let Some(n) = a.needed_by {
             about.push(format!("Needed by {}", long_date(n)));
@@ -1283,6 +1429,7 @@ impl SearchRequest {
                 attachments: Attachments::With,
                 ..Default::default()
             },
+            holidays: OptionalHolidays::default(),
         }
     }
 }
@@ -1618,6 +1765,99 @@ mod tests {
         assert!(r.contains("  - Type: Data request from the public\n"));
         assert!(r.contains("  - Reference number: DR-2026-041\n"));
         assert!(r.ends_with(&format!("(Purview KeyQL):\n{}\n", b.query)));
+    }
+
+    #[test]
+    fn minnesota_holidays() {
+        let none = OptionalHolidays::default();
+        // 2026: Jan 1 Thu, MLK Jan 19, Presidents Feb 16, Memorial May 25, Juneteenth Fri Jun 19,
+        // July 4 is a Saturday -> Fri Jul 3, Labor Sep 7, Veterans Wed Nov 11, Thanksgiving Nov 26, Christmas Fri.
+        assert_eq!(
+            mn_holidays(2026, none),
+            vec![
+                d(2026, 1, 1),
+                d(2026, 1, 19),
+                d(2026, 2, 16),
+                d(2026, 5, 25),
+                d(2026, 6, 19),
+                d(2026, 7, 3),
+                d(2026, 9, 7),
+                d(2026, 11, 11),
+                d(2026, 11, 26),
+                d(2026, 12, 25),
+            ]
+        );
+        let all = OptionalHolidays {
+            indigenous_peoples_day: true,
+            day_after_thanksgiving: true,
+        };
+        let h = mn_holidays(2026, all);
+        assert!(h.contains(&d(2026, 10, 12)) && h.contains(&d(2026, 11, 27)));
+        // Sunday holidays move to Monday: Christmas 2022, Juneteenth 2022.
+        assert!(mn_holidays(2022, none).contains(&d(2022, 12, 26)));
+        assert!(mn_holidays(2022, none).contains(&d(2022, 6, 20)));
+        // New Year's Day 2028 is a Saturday: observed Friday, December 31, 2027.
+        assert!(!is_business_day(d(2027, 12, 31), none));
+    }
+
+    #[test]
+    fn ten_business_days() {
+        let none = OptionalHolidays::default();
+        // Received Friday Oct 23, 2026: Oct 26-30 and Nov 2-6 -> Friday Nov 6.
+        assert_eq!(subject_deadline(d(2026, 10, 23), none), d(2026, 11, 6));
+        // Received Monday Nov 9: Veterans Day (Wed 11) and Thanksgiving (Thu 26) are skipped.
+        // 10, 12, 13, 16, 17, 18, 19, 20, 23, 24 -> Tuesday Nov 24.
+        assert_eq!(subject_deadline(d(2026, 11, 9), none), d(2026, 11, 24));
+        // Received Thu Nov 19: 20, 23, 24, 25, (26 off), 27, 30, Dec 1, 2, 3, 4 -> Fri Dec 4.
+        assert_eq!(subject_deadline(d(2026, 11, 19), none), d(2026, 12, 4));
+        // With the day after Thanksgiving off as well, one day later: Mon Dec 7.
+        let fri = OptionalHolidays {
+            day_after_thanksgiving: true,
+            ..none
+        };
+        assert_eq!(subject_deadline(d(2026, 11, 19), fri), d(2026, 12, 7));
+        // A request that comes in on a Saturday still counts from the next business day.
+        assert_eq!(subject_deadline(d(2026, 10, 24), none), d(2026, 11, 6));
+    }
+
+    #[test]
+    fn deadline_checks() {
+        let mut s = named();
+        s.keywords.words = v(&["budget"]);
+        s.about.kind = RequestKind::AboutThemselves;
+        let about = |s: &SearchRequest| -> Vec<(Level, String)> {
+            s.build_at(today())
+                .for_step(Step::About)
+                .map(|n| (n.level, n.message.clone()))
+                .collect()
+        };
+        assert_eq!(about(&s)[0].0, Level::Info); // no date received yet
+        s.about.received = Some(d(2026, 10, 1)); // due Thu Oct 15, before "today" (Oct 23)
+        assert_eq!(
+            about(&s),
+            vec![(Level::Warning, "The deadline to respond was Thursday, October 15, 2026. Respond as soon as you can.".to_owned())]
+        );
+        s.about.received = Some(d(2026, 10, 23)); // due Fri Nov 6
+        s.about.needed_by = Some(d(2026, 11, 9));
+        assert_eq!(about(&s)[0].0, Level::Warning);
+        s.about.needed_by = Some(d(2026, 11, 4));
+        assert!(about(&s).is_empty());
+        assert!(s.build_at(today()).can_save());
+    }
+
+    #[test]
+    fn deadline_in_summary_only_for_subject_requests() {
+        let mut s = named();
+        s.about.received = Some(d(2026, 10, 23));
+        let line = "Minnesota deadline to respond: Friday, November 6, 2026 (10 business days, Minn. Stat. § 13.04, subd. 3)";
+        s.about.kind = RequestKind::PublicData;
+        assert!(!s.describe(today())[0].1.iter().any(|l| l == line));
+        s.about.kind = RequestKind::AboutThemselves;
+        assert!(
+            s.describe(today())[0].1.iter().any(|l| l == line),
+            "{:?}",
+            s.describe(today())
+        );
     }
 
     #[test]
