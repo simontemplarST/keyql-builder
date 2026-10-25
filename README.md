@@ -111,3 +111,7 @@ On Windows the release build opens no console window. Saved answers live in
 - `src/query.rs` holds the request model, the KeyQL generator, the plain-English summary, the email text and the checks. It is pure and unit tested.
 - `src/app.rs` holds the wizard UI, the chip and date inputs, saving and settings.
 - `src/main.rs` sets up the window.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
