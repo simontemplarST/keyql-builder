@@ -4,9 +4,14 @@
 
 **Ask for a Microsoft Purview eDiscovery search without knowing any search syntax.**
 
-Staff answer a few plain-language questions. The app writes the KeyQL query for them and saves it as a
-`.req` request file to email to whoever runs Purview searches, who opens it in the same app and
-copies the query into Purview.
+Two apps that work together:
+
+**The request builder** (web and desktop): staff answer a few plain-language questions, and it saves a
+`.req` request file holding the KeyQL query. Nothing they type leaves their device.
+
+**The search runner** (desktop, for the eDiscovery administrator): opens the `.req` file, signs the admin in
+to Microsoft 365, and creates and estimates the search in Microsoft Purview, recording every step in a
+tamper-evident audit log.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Rust 2024](https://img.shields.io/badge/rust-2024%20edition-orange.svg)
@@ -26,6 +31,8 @@ copies the query into Purview.
 - [A tour](#a-tour)
 - [Privacy: nothing leaves your device](#privacy-nothing-leaves-your-device)
 - [The file it makes](#the-file-it-makes)
+- [The search runner](#the-search-runner)
+- [Setting up the search runner](#setting-up-the-search-runner)
 - [How answers become KeyQL](#how-answers-become-keyql)
 - [Checks](#checks)
 - [Design basis](#design-basis)
@@ -56,7 +63,6 @@ what they asked for, and whoever runs the search gets an exact, repeatable query
 - **A check-your-answers page** that summarizes the request in plain English, with **Change** links.
 - **Problems are explained, not just flagged.** Each problem has a link that takes you to the step to fix it.
 - **Saves one `.req` request file** named after the request and the date, ready to attach to an email. It holds every answer, the plain-English summary and the exact KeyQL query.
-- **Opens request files.** The IT Director chooses **Open a request file…** (or drops the file on the window) to read the request and **Copy KeyQL query**.
 - **Writes the email for you.** It opens your mail program with the To, Subject and body filled in, or copies the text.
 - **A copy for your records.** One click saves a text file with what was asked for, the plain-English summary and the exact search.
 - **Remembers your answers** if you close the app, so a half-finished request isn't lost.
@@ -104,21 +110,16 @@ The web version shows this while it loads:
 **Save request file…** writes one binary `.req` file. The sample request (`--example` on the desktop,
 `?example` in the browser) is in [`docs/example.req`](docs/example.req).
 
-**For the IT Director:** open the app, choose **Open a request file…** (or drop the file on the window), and you
-see the whole request: the plain-English summary, whose content to search, the deadline if there is one, and
-the search itself with a **Copy KeyQL query** button. Paste it into
-**Purview → eDiscovery → (case) → Search → Query → KeyQL editor**. For the sample request that's:
+**For the eDiscovery administrator:** open it with the [search runner](#the-search-runner), which shows the
+whole request, creates the search in Purview and runs the estimate. The builder can't open request files.
+For the sample request the query is:
 
 ```text
 ("Highway 56" AND contract AND (sent:2026-01-01..2026-10-25 OR received:2026-01-01..2026-10-25 OR LastModifiedTime:2026-01-01..2026-10-25) AND (kind:email OR kind:docs) AND HasAttachment:true) NOT newsletter
 ```
 
-The people and places to search are in the summary, not in the query: Purview picks them separately (as data
-sources).
-
-<p align="center">
-  <img src="docs/screenshots/open-request.png" alt="A request file opened in the app: integrity line, the query with Copy KeyQL query, and the summary" width="640">
-</p>
+The people and places to search are in the file alongside the query: Purview takes them separately, as data
+sources.
 
 ### Format
 
@@ -138,6 +139,78 @@ sources).
   other data request.
 
 The code is in [`src/reqfile.rs`](src/reqfile.rs).
+
+## The search runner
+
+A separate desktop app for the eDiscovery administrator. It isn't part of the web app and can't be reached
+from the request builder.
+
+| | |
+|---|---|
+| <img src="docs/screenshots/runner-home.png" alt="Search runner home page" width="420"> | <img src="docs/screenshots/runner-sources.png" alt="Where to search: mailboxes and sites, with names flagged" width="420"> |
+| **Sign in and open the request.** The admin signs in with their Microsoft 365 account and opens (or drops) the `.req` file. The file's integrity and SHA-256 are shown and logged. | **Where to search.** Email addresses and SharePoint URLs from the request are filled in. Names ("Pat Lee") and descriptions ("Highway Department shared mailbox") must be given a real address or left out on purpose. |
+| <img src="docs/screenshots/runner-confirm.png" alt="Confirmation before running the search" width="420"> | <img src="docs/screenshots/runner-results.png" alt="Each step, then the estimated results" width="420"> |
+| **Choose or create the case, then confirm.** Pick an existing eDiscovery case or create one named after the request and its reference number. | **Create and estimate.** The runner creates the search with the request's exact query, adds each mailbox and site, runs Purview's estimate and shows the counts. Review and export continue in Purview. |
+
+### What it does in Purview
+
+Through the Microsoft Graph eDiscovery API, as the signed-in admin:
+
+1. Creates a case (with the request's reference number as its external ID), or uses the one chosen.
+2. Creates a search named after the request and its save date, with the request's KeyQL as the query and what was
+   asked for as the description. "Search everyone" becomes every mailbox and site in the tenant.
+3. Adds each mailbox (with its OneDrive) and each SharePoint site.
+4. Runs Purview's estimate and waits for it: items, size, mailboxes and sites with results, partly indexed items.
+
+It stops there on purpose. Reviewing, holds, review sets and exports stay in the Purview portal.
+
+### The audit log
+
+<p align="center">
+  <img src="docs/screenshots/runner-audit.png" alt="The audit log, checked and intact, with its fingerprint" width="640">
+</p>
+
+Every action is written to the log **before** the runner moves on, and nothing runs if the log can't be
+written. Entries record who (the signed-in admin, or the computer account before sign-in), when (UTC), and the
+details: the request file's name and SHA-256, the exact query, the case and search IDs, each mailbox and site,
+names the admin left out, the estimate's results, sign-ins, sign-outs, settings changes and errors.
+
+- **Tamper-evident.** Each entry is a JSON line holding the SHA-256 of the entry before it. **Check the log** walks
+  the chain and names the first entry that was changed, removed or reordered.
+- **Fingerprint.** The newest entry's hash. Write it down somewhere else (the request's file, an email) and the log
+  up to that point can be proven unaltered later. Without that, someone who can write the file could rebuild the
+  whole chain.
+- **Format.** JSON Lines (`audit-log.jsonl`), so other tools can read it. Choose a shared, backed-up folder in
+  Settings.
+- **Purview keeps its own record too:** searches created through the API appear in Purview's audit log under the
+  admin's account.
+
+### Security
+
+- **Sign-in** uses the OAuth 2.0 authorization code flow with PKCE in the admin's own browser, so MFA and
+  Conditional Access apply as usual. The app is a public client: no secrets are stored.
+- **Tokens** are kept in memory only, never written to disk. Closing the app or **Sign out** discards them.
+- **It only talks to** `login.microsoftonline.com` and `graph.microsoft.com`.
+- **Permissions** are delegated: the runner can do only what the signed-in admin can already do in Purview.
+
+## Setting up the search runner
+
+You need an account that can register apps and grant admin consent in Microsoft Entra ID.
+
+1. **Register the app.** Entra admin center → **App registrations** → **New registration**.
+   - Name: `eDiscovery Search Runner`. Supported account types: **this organizational directory only**.
+   - Redirect URI: platform **Public client/native (mobile & desktop)**, URI `http://localhost`.
+     (Any port is allowed for `http://localhost`; the runner picks a free one each time.)
+2. **Permissions.** **API permissions** → **Add a permission** → **Microsoft Graph** → **Delegated**:
+   `eDiscovery.ReadWrite.All` and `User.Read`. Then **Grant admin consent**.
+3. **Purview role.** The admins who will run searches need the **eDiscovery Manager** role group (their own
+   cases) or **eDiscovery Administrator** (all cases) in the Microsoft Purview portal → **Settings** → **Roles and
+   scopes**.
+4. **Settings in the runner.** Copy the registration's **Directory (tenant) ID** and **Application (client) ID**
+   into **Settings**, and choose where the audit log lives.
+
+Optional hardening: on the app's **Enterprise application**, set **Assignment required** to **Yes** and assign only
+the eDiscovery admins, so nobody else can even sign in to it.
 
 ## How answers become KeyQL
 
@@ -224,15 +297,19 @@ In practice:
 
 You need a Rust toolchain: <https://rustup.rs>.
 
-### Desktop app
+### Desktop apps
 
 ```sh
 git clone https://github.com/simontemplarST/keyql-builder.git
 cd keyql-builder
-cargo run --release              # start the app
-cargo run --release -- --example # start on the check page with a sample request
-cargo test                       # query generator and UI helper tests
+cargo run --release                      # the request builder
+cargo run --release -- --example         # ... starting on the check page with a sample request
+cargo run --release -p keyql-runner      # the search runner
+cargo test --workspace                   # every test: query, request file, sign-in, Graph calls, audit log
 ```
+
+The runner's tests include a full sign-in and a full create-and-estimate run against local stand-ins for
+Microsoft's sign-in and Graph services; they don't touch a real tenant.
 
 The release binary is in `target/release/` (`keyql-builder.exe` on Windows, which opens no console window).
 Answers are saved in `%APPDATA%\keyql-builder\` on Windows, `~/Library/Application Support/keyql-builder/`
@@ -250,8 +327,8 @@ trunk serve --release            # http://127.0.0.1:8080   (add ?example for the
 trunk build --release            # static files in dist/
 ```
 
-In the browser, **Save request file…** downloads the `.req` file, **Open a request file…** uses the browser's
-file picker, and **Show the file in its folder** is hidden.
+In the browser, **Save request file…** downloads the `.req` file, and **Show the file in its folder** is hidden.
+The search runner is desktop only.
 
 > The post-build hook in [`Trunk.toml`](Trunk.toml) fixes the size the loading bar counts to (trunk records the
 > size from before `wasm-opt`). It uses `sh`, `wc` and GNU `sed`; on macOS install `gsed` or drop the hook (the bar
@@ -293,18 +370,26 @@ header as well is a good idea.
 ## Project layout
 
 ```text
-src/query.rs     request model, KeyQL generator, plain-English summary, email text, checks (pure, unit tested)
-src/app.rs       the wizard UI: steps, chip and date inputs, saving, settings
-src/main.rs      desktop window setup, and the browser entry point
-index.html       web page: loading screen and Content-Security-Policy
-loader.mjs       download progress for the loading screen (trunk initializer)
-Trunk.toml       web build settings and the post-build hook
-src/reqfile.rs   the .req request file: layout, checksum, reading and writing (unit tested)
-docs/            screenshots and the sample request file
+src/lib.rs          shared by both apps:
+src/query.rs          request model, KeyQL generator, plain-English summary, email text, checks
+src/reqfile.rs        the .req request file: layout, checksum, reading and writing
+src/ui_kit.rs         the shared look: colors, drawn badges, callouts, cards, step list
+src/app.rs          the request builder: wizard UI, chip and date inputs, saving, settings
+src/main.rs         the builder's desktop window and browser entry point
+index.html          the builder's web page: loading screen and Content-Security-Policy
+loader.mjs          download progress for the loading screen (trunk initializer)
+Trunk.toml          web build settings and the post-build hook
+runner/src/auth.rs  sign-in: OAuth 2.0 + PKCE with a loopback redirect, token refresh
+runner/src/graph.rs the Microsoft Graph eDiscovery calls and the create-and-estimate run
+runner/src/plan.rs  turning a request into mailboxes, sites and Purview names
+runner/src/audit.rs the hash-chained audit log
+runner/src/app.rs   the runner's screens
+docs/               screenshots and the sample request file
 ```
 
 Built with [egui / eframe](https://github.com/emilk/egui), [chrono](https://github.com/chronotope/chrono),
-[rfd](https://github.com/PolyMeilex/rfd) for the desktop save dialog and [trunk](https://trunkrs.dev) for the web build.
+[rfd](https://github.com/PolyMeilex/rfd) for file dialogs, [trunk](https://trunkrs.dev) for the web build, and in the
+runner [ureq](https://github.com/algesten/ureq) (with rustls) and [sha2](https://github.com/RustCrypto/hashes).
 
 ## License
 

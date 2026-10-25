@@ -1,5 +1,5 @@
-//! egui front end: a step-by-step request wizard that saves a `.req` request file, and a
-//! read-only view for opening one.
+//! egui front end: a step-by-step request wizard that saves a `.req` request file. Opening and
+//! running request files is the separate search runner's job (`runner/`).
 //!
 //! The layout follows common form-usability guidance (GOV.UK "one thing per
 //! page" and "check answers", NN/g wizard guidelines): a visible list of steps,
@@ -11,17 +11,19 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use chrono::{Duration, NaiveDate};
-use eframe::egui::{
-    self, Align, Color32, FontId, Key, Layout, Margin, RichText, Sense, Stroke, TextStyle, Vec2,
-};
+use eframe::egui::{self, Align, Color32, FontId, Key, Layout, Margin, RichText, Stroke, Vec2};
 use egui_extras::DatePickerButton;
 use serde::{Deserialize, Serialize};
 
-use crate::query::{
+use keyql_builder::query::{
     self, Attachments, DateField, DateMode, Found, KeywordScope, Level, Near, OptionalHolidays,
     RequestKind, SearchRequest, SizeOp, Step,
 };
-use crate::reqfile;
+use keyql_builder::reqfile;
+use keyql_builder::ui_kit::{
+    ACCENT, StepState, Tone, app_mark, badge, callout, choice_card, field_label, numbered,
+    primary_button, setup_style, status_line, step_item, success_color, tone_color, warning_color,
+};
 
 const SOURCE_URL: &str = "https://github.com/simontemplarST/keyql-builder";
 
@@ -128,12 +130,6 @@ struct Settings {
 // App state
 // ---------------------------------------------------------------------------
 
-/// A request file opened to read.
-struct Viewed {
-    file: String,
-    contents: Result<reqfile::Contents, String>,
-}
-
 /// Details found in a pasted request, each with a tick box.
 struct Picks {
     found: Found,
@@ -227,10 +223,6 @@ fn plain_join(parts: &[String]) -> String {
 /// Text typed into a field but not yet turned into a chip or date, keyed by field.
 type Pending = HashMap<String, String>;
 
-/// A file picked or dropped in the browser: (name, bytes), filled in by a callback.
-#[cfg(target_arch = "wasm32")]
-type Incoming = std::rc::Rc<std::cell::RefCell<Option<(String, Vec<u8>)>>>;
-
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct KeyqlApp {
@@ -262,13 +254,6 @@ pub struct KeyqlApp {
     /// Set when the page changes, so the next page opens at the top.
     #[serde(skip)]
     scroll_top: bool,
-    /// A request file opened to read, shown instead of the wizard.
-    #[serde(skip)]
-    viewing: Option<Viewed>,
-    /// A file picked in the browser, handed over from the file input's callback.
-    #[cfg(target_arch = "wasm32")]
-    #[serde(skip)]
-    incoming: Incoming,
     #[serde(skip)]
     applied_zoom: Option<f32>,
     #[serde(skip)]
@@ -343,91 +328,6 @@ impl KeyqlApp {
         out
     }
 
-    fn open_bytes(&mut self, file: String, bytes: &[u8]) {
-        self.viewing = Some(Viewed {
-            file,
-            contents: reqfile::decode(bytes).map_err(|e| e.to_string()),
-        });
-        self.saved = None;
-        self.scroll_top = true;
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn open_path(&mut self, path: &std::path::Path) {
-        let file = path
-            .file_name()
-            .map(|f| f.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        match std::fs::read(path) {
-            Ok(bytes) => self.open_bytes(file, &bytes),
-            Err(e) => {
-                self.viewing = Some(Viewed {
-                    file,
-                    contents: Err(format!("The file couldn't be read: {e}")),
-                });
-            }
-        }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn open_file(&mut self, _ctx: &egui::Context) {
-        let mut dialog = rfd::FileDialog::new()
-            .set_title("Open a request file")
-            .add_filter("eDiscovery request (.req)", &[reqfile::EXTENSION]);
-        if let Some(dir) = documents_dir() {
-            dialog = dialog.set_directory(dir);
-        }
-        if let Some(path) = dialog.pick_file() {
-            self.open_path(&path);
-        }
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn open_file(&mut self, ctx: &egui::Context) {
-        pick_file(self.incoming.clone(), ctx.clone());
-    }
-
-    /// Files dropped on the window, and (in the browser) a file picked with Open.
-    fn take_incoming(&mut self, ctx: &egui::Context) {
-        #[cfg(target_arch = "wasm32")]
-        {
-            let picked = self.incoming.borrow_mut().take();
-            if let Some((name, bytes)) = picked {
-                self.open_bytes(name, &bytes);
-            }
-        }
-        let Some(f) = ctx.input(|i| i.raw.dropped_files.first().cloned()) else {
-            return;
-        };
-        let name = f
-            .path()
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        #[cfg(not(target_arch = "wasm32"))]
-        match f.bytes() {
-            Ok(bytes) => self.open_bytes(name, &bytes),
-            Err(e) => {
-                self.viewing = Some(Viewed {
-                    file: name,
-                    contents: Err(format!("The file couldn't be read: {e}")),
-                });
-            }
-        }
-        // The browser reads dropped files asynchronously; the bytes arrive like a picked file.
-        #[cfg(target_arch = "wasm32")]
-        {
-            let slot = self.incoming.clone();
-            let ctx = ctx.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                if let Ok(bytes) = f.bytes_async().await {
-                    *slot.borrow_mut() = Some((name, bytes));
-                    ctx.request_repaint();
-                }
-            });
-        }
-    }
-
     fn step_index(&self) -> usize {
         STEPS.iter().position(|s| *s == self.step).unwrap_or(0)
     }
@@ -443,39 +343,6 @@ impl KeyqlApp {
 
 fn today() -> NaiveDate {
     chrono::Local::now().date_naive()
-}
-
-fn setup_style(ctx: &egui::Context) {
-    ctx.all_styles_mut(|style| {
-        style.text_styles = [
-            (TextStyle::Heading, FontId::proportional(24.0)),
-            (TextStyle::Body, FontId::proportional(16.0)),
-            (TextStyle::Button, FontId::proportional(16.0)),
-            (TextStyle::Small, FontId::proportional(13.5)),
-            (TextStyle::Monospace, FontId::monospace(15.0)),
-        ]
-        .into();
-        style.spacing.item_spacing = Vec2::new(10.0, 9.0);
-        style.spacing.button_padding = Vec2::new(12.0, 6.0);
-        style.spacing.interact_size.y = 30.0;
-        style.spacing.icon_width = 18.0;
-        style.spacing.icon_width_inner = 10.0;
-    });
-    // Stronger text and field borders than egui's defaults: hint text >= 7:1 and
-    // field outlines >= 3:1 against the background (WCAG 1.4.3 / 1.4.11).
-    ctx.style_mut_of(egui::Theme::Dark, |s| {
-        s.visuals.weak_text_color = Some(Color32::from_gray(175));
-        s.visuals.hyperlink_color = Color32::from_rgb(120, 170, 245);
-        s.visuals.widgets.noninteractive.fg_stroke.color = Color32::from_gray(225);
-        s.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_gray(115));
-    });
-    ctx.style_mut_of(egui::Theme::Light, |s| {
-        s.visuals.weak_text_color = Some(Color32::from_gray(80));
-        // egui's default link blue is about 3:1 on white; this one is over 6:1.
-        s.visuals.hyperlink_color = Color32::from_rgb(20, 90, 190);
-        s.visuals.widgets.noninteractive.fg_stroke.color = Color32::from_gray(25);
-        s.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_gray(120));
-    });
 }
 
 impl eframe::App for KeyqlApp {
@@ -500,7 +367,6 @@ impl eframe::App for KeyqlApp {
             self.applied_theme = Some(self.settings.theme);
         }
 
-        self.take_incoming(&ctx);
         self.req.holidays = self.settings.holidays;
         let mut built = self.req.build();
         built.notices.extend(self.date_problems());
@@ -510,7 +376,7 @@ impl eframe::App for KeyqlApp {
             .resizable(false)
             .exact_size(250.0)
             .show(ui, |ui| self.step_list(ui, &built));
-        if self.saved.is_none() && self.viewing.is_none() {
+        if self.saved.is_none() {
             egui::Panel::bottom("nav").show(ui, |ui| self.nav_bar(ui, &built));
             // Only when there's room beside the page; the check page shows the same thing in full.
             if ctx.content_rect().width() >= 1200.0 && self.step != Step::Review {
@@ -537,9 +403,7 @@ impl eframe::App for KeyqlApp {
                     .inner_margin(Margin::symmetric(28, 18))
                     .show(ui, |ui| {
                         ui.set_max_width(ui.available_width().min(780.0));
-                        if self.viewing.is_some() {
-                            self.viewer_page(ui);
-                        } else if self.saved.is_some() {
+                        if self.saved.is_some() {
                             self.done_page(ui);
                         } else {
                             self.step_page(ui, &built);
@@ -550,7 +414,6 @@ impl eframe::App for KeyqlApp {
 
         self.reset_dialog(&ctx);
         self.settings_window(&ctx);
-        drop_hint(&ctx);
     }
 }
 
@@ -579,13 +442,6 @@ impl KeyqlApp {
                 if ui.button("Start a new request").clicked() {
                     self.confirm_reset = true;
                 }
-                if ui
-                    .button("Open a request file…")
-                    .on_hover_text("Read a .req file someone sent you and copy its search. You can also drop the file on this window.")
-                    .clicked()
-                {
-                    self.open_file(ui.ctx());
-                }
             });
         });
         ui.add_space(6.0);
@@ -597,7 +453,7 @@ impl KeyqlApp {
         ui.add_space(4.0);
         let mut target = None;
         for (i, &step) in STEPS.iter().enumerate() {
-            let current = step == self.step && self.saved.is_none() && self.viewing.is_none();
+            let current = step == self.step && self.saved.is_none();
             let (state, status) = self.step_status(step, built);
             if step_item(ui, i + 1, step_title(step), state, status, current).clicked() {
                 target = Some(step);
@@ -605,7 +461,6 @@ impl KeyqlApp {
         }
         if let Some(step) = target {
             self.saved = None;
-            self.viewing = None;
             self.go(step);
         }
         ui.add_space(12.0);
@@ -1408,86 +1263,6 @@ fn type_card(ui: &mut egui::Ui, selected: &mut Vec<String>, t: &query::ItemType)
     }
 }
 
-/// A clickable card with a tick box (or a round radio mark), a title and a description.
-/// Returns true when it was clicked.
-fn choice_card(
-    ui: &mut egui::Ui,
-    id_salt: impl std::hash::Hash + std::fmt::Debug,
-    on: bool,
-    title: &str,
-    description: &str,
-    radio: bool,
-    width: f32,
-) -> bool {
-    let visuals = ui.visuals().clone();
-    let id = ui.scope_id().with(&id_salt);
-    let hovered = ui.ctx().read_response(id).is_some_and(|r| r.hovered());
-    let stroke = if on {
-        Stroke::new(2.0, visuals.selection.stroke.color)
-    } else if hovered {
-        Stroke::new(1.5, visuals.selection.stroke.color.gamma_multiply(0.8))
-    } else {
-        Stroke::new(
-            1.0,
-            visuals.widgets.inactive.bg_stroke.color.gamma_multiply(2.0),
-        )
-    };
-    let fill = if on {
-        visuals.selection.bg_fill.gamma_multiply(0.25)
-    } else {
-        visuals.extreme_bg_color
-    };
-    let frame = egui::Frame::new()
-        .stroke(stroke)
-        .fill(fill)
-        .corner_radius(8)
-        .inner_margin(Margin::symmetric(14, 10))
-        .show(ui, |ui| {
-            // The frame's margin and stroke sit outside this width.
-            ui.set_width(width - 30.0);
-            ui.horizontal(|ui| {
-                // Drawn for show; the whole card handles the click.
-                let mut shown = on;
-                if radio {
-                    ui.add(egui::RadioButton::new(shown, ""));
-                } else {
-                    ui.add(egui::Checkbox::without_text(&mut shown));
-                }
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(title).strong());
-                    if !description.is_empty() {
-                        ui.label(RichText::new(description).weak());
-                    }
-                });
-            });
-        });
-    let resp = ui
-        .interact(frame.response.rect, id, Sense::click())
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
-    resp.widget_info(|| {
-        egui::WidgetInfo::selected(
-            if radio {
-                egui::Role::RadioButton
-            } else {
-                egui::Role::CheckBox
-            },
-            true,
-            on,
-            title,
-        )
-    });
-    if resp.has_focus() {
-        ui.painter().rect_stroke(
-            frame.response.rect.expand(2.0),
-            8,
-            visuals.selection.stroke,
-            egui::StrokeKind::Outside,
-        );
-    }
-    ui.add_space(4.0);
-    resp.clicked()
-}
-
 fn narrow_page(ui: &mut egui::Ui, req: &mut SearchRequest, pending: &mut Pending) {
     let f = &mut req.filters;
 
@@ -1914,8 +1689,8 @@ impl KeyqlApp {
         numbered(
             ui,
             1,
-            "Email the request file to the IT Director as an attachment. They open it in this app \
-             with Open a request file.",
+            "Email the request file to the IT Director as an attachment. They run it with the \
+             eDiscovery Search Runner.",
         );
         numbered(
             ui,
@@ -1930,7 +1705,7 @@ impl KeyqlApp {
         );
         ui.add_space(12.0);
 
-        let (subject, body) = self.req.email(&file, app_url().as_deref(), today());
+        let (subject, body) = self.req.email(&file, today());
         ui.horizontal_wrapped(|ui| {
             if primary_button(ui, "Write the email")
                 .on_hover_text("Opens your email program. Remember to attach the file.")
@@ -2000,104 +1775,6 @@ impl KeyqlApp {
                 self.reset();
             }
         });
-    }
-
-    /// A request file opened to read: its integrity, the query to copy and the summary.
-    fn viewer_page(&mut self, ui: &mut egui::Ui) {
-        let Some(v) = self.viewing.as_ref() else {
-            return;
-        };
-        ui.label(RichText::new("Request file").weak());
-        match &v.contents {
-            Err(msg) => {
-                ui.label(RichText::new(&v.file).size(26.0).strong());
-                ui.add_space(10.0);
-                callout(ui, Tone::Error, "This file can't be opened", |ui| {
-                    ui.label(msg);
-                });
-            }
-            Ok(c) => {
-                ui.label(RichText::new(c.name()).size(26.0).strong());
-                status_line(
-                    ui,
-                    Tone::Success,
-                    format!(
-                        "{} is complete and unchanged since it was saved on {}.",
-                        v.file,
-                        query::long_date(c.saved_on)
-                    ),
-                );
-                ui.add_space(16.0);
-                ui.label(RichText::new("The search to run").size(20.0).strong());
-                ui.label(
-                    RichText::new(
-                        "Paste it into Purview: eDiscovery, your case, Search, Query, then the KeyQL editor.",
-                    )
-                    .weak(),
-                );
-                ui.add_space(4.0);
-                egui::Frame::new()
-                    .fill(ui.visuals().extreme_bg_color)
-                    .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
-                    .corner_radius(8)
-                    .inner_margin(Margin::same(14))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.add(
-                            egui::Label::new(RichText::new(&c.query).monospace())
-                                .wrap()
-                                .selectable(true),
-                        );
-                    });
-                ui.add_space(6.0);
-                let now = ui.input(|i| i.time);
-                let copied = self.copied_at.is_some_and(|t| now - t < 2.0);
-                ui.horizontal(|ui| {
-                    if primary_button(ui, if copied { "Copied" } else { "Copy KeyQL query" })
-                        .clicked()
-                    {
-                        ui.ctx().copy_text(c.query.clone());
-                        self.copied_at = Some(now);
-                    }
-                    ui.label(
-                        RichText::new(format!("{} characters", c.query.chars().count())).weak(),
-                    );
-                });
-                if copied {
-                    ui.ctx().request_repaint();
-                }
-                ui.add_space(20.0);
-                ui.label(RichText::new("What was asked for").size(20.0).strong());
-                ui.add_space(4.0);
-                for (heading, lines) in &c.summary {
-                    egui::Frame::new()
-                        .fill(ui.visuals().extreme_bg_color)
-                        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
-                        .corner_radius(8)
-                        .inner_margin(Margin::symmetric(16, 12))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.label(RichText::new(heading).strong());
-                            for l in lines {
-                                ui.add(egui::Label::new(l).wrap().selectable(true));
-                            }
-                        });
-                    ui.add_space(4.0);
-                }
-                if c.app_version != env!("CARGO_PKG_VERSION") {
-                    ui.label(
-                        RichText::new(format!("Saved with version {} of the app.", c.app_version))
-                            .small()
-                            .weak(),
-                    );
-                }
-            }
-        }
-        ui.add_space(16.0);
-        if ui.button("Close").clicked() {
-            self.viewing = None;
-            self.scroll_top = true;
-        }
     }
 
     fn reset_dialog(&mut self, ctx: &egui::Context) {
@@ -2196,375 +1873,6 @@ impl KeyqlApp {
 // ---------------------------------------------------------------------------
 // Widgets
 // ---------------------------------------------------------------------------
-
-/// What a message is about. Sets its color and the drawn badge beside it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Tone {
-    Info,
-    Tip,
-    Success,
-    Warning,
-    Error,
-}
-
-impl From<Level> for Tone {
-    fn from(l: Level) -> Self {
-        match l {
-            Level::Error => Tone::Error,
-            Level::Warning => Tone::Warning,
-            Level::Info => Tone::Info,
-        }
-    }
-}
-
-const ACCENT: Color32 = Color32::from_rgb(30, 100, 200);
-
-fn tone_color(ui: &egui::Ui, tone: Tone) -> Color32 {
-    let dark = ui.visuals().dark_mode;
-    match tone {
-        Tone::Info if dark => Color32::from_rgb(120, 170, 245),
-        Tone::Info => ACCENT,
-        Tone::Tip if dark => Color32::from_rgb(230, 180, 90),
-        Tone::Tip => Color32::from_rgb(160, 100, 0),
-        Tone::Success => success_color(ui),
-        Tone::Warning => warning_color(ui),
-        Tone::Error => error_color(ui),
-    }
-}
-
-/// A round badge drawn with shapes (no emoji): i, !, a tick or a cross.
-fn paint_badge(
-    painter: &egui::Painter,
-    center: egui::Pos2,
-    radius: f32,
-    tone: Tone,
-    color: Color32,
-) {
-    painter.circle_filled(center, radius, color);
-    let ink = Color32::WHITE;
-    let w = (radius * 0.2).max(1.6);
-    match tone {
-        Tone::Success => {
-            let r = radius;
-            painter.line(
-                vec![
-                    center + Vec2::new(-0.45 * r, 0.02 * r),
-                    center + Vec2::new(-0.12 * r, 0.36 * r),
-                    center + Vec2::new(0.48 * r, -0.32 * r),
-                ],
-                Stroke::new(w, ink),
-            );
-        }
-        Tone::Error => {
-            let d = radius * 0.38;
-            painter.line_segment(
-                [center + Vec2::new(-d, -d), center + Vec2::new(d, d)],
-                Stroke::new(w, ink),
-            );
-            painter.line_segment(
-                [center + Vec2::new(-d, d), center + Vec2::new(d, -d)],
-                Stroke::new(w, ink),
-            );
-        }
-        Tone::Warning => {
-            painter.line_segment(
-                [
-                    center + Vec2::new(0.0, -0.5 * radius),
-                    center + Vec2::new(0.0, 0.12 * radius),
-                ],
-                Stroke::new(w, ink),
-            );
-            painter.circle_filled(center + Vec2::new(0.0, 0.45 * radius), w * 0.6, ink);
-        }
-        Tone::Info | Tone::Tip => {
-            painter.circle_filled(center + Vec2::new(0.0, -0.45 * radius), w * 0.6, ink);
-            painter.line_segment(
-                [
-                    center + Vec2::new(0.0, -0.12 * radius),
-                    center + Vec2::new(0.0, 0.5 * radius),
-                ],
-                Stroke::new(w, ink),
-            );
-        }
-    }
-}
-
-fn badge(ui: &mut egui::Ui, tone: Tone, size: f32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
-    paint_badge(
-        ui.painter(),
-        rect.center(),
-        size / 2.0,
-        tone,
-        tone_color(ui, tone),
-    );
-}
-
-/// A badge and a line of text in the tone's color, wrapping as needed.
-fn status_line(ui: &mut egui::Ui, tone: Tone, text: impl Into<String>) {
-    let color = tone_color(ui, tone);
-    ui.horizontal_top(|ui| {
-        ui.spacing_mut().item_spacing.x = 8.0;
-        ui.add_space(1.0);
-        ui.vertical(|ui| {
-            ui.add_space(2.0);
-            badge(ui, tone, 16.0);
-        });
-        let text: String = text.into();
-        ui.add(egui::Label::new(RichText::new(text).color(color)).wrap());
-    });
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum StepState {
-    Plain,
-    Done,
-    Warning,
-    Error,
-}
-
-/// One row of the step list: a numbered circle (or a drawn tick), the title and a status line.
-fn step_item(
-    ui: &mut egui::Ui,
-    number: usize,
-    title: &str,
-    state: StepState,
-    status: &str,
-    current: bool,
-) -> egui::Response {
-    let (rect, resp) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 54.0), Sense::click());
-    resp.widget_info(|| {
-        egui::WidgetInfo::labeled(
-            egui::Role::Button,
-            true,
-            format!("Step {number}: {title}. {status}"),
-        )
-    });
-    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-    let v = ui.visuals().clone();
-    let painter = ui.painter();
-    if current {
-        painter.rect_filled(rect, 6, v.selection.bg_fill.gamma_multiply(0.35));
-        painter.rect_filled(
-            egui::Rect::from_min_size(rect.min, Vec2::new(4.0, rect.height())),
-            2,
-            ACCENT,
-        );
-    } else if resp.hovered() {
-        painter.rect_filled(rect, 6, v.widgets.hovered.weak_bg_fill);
-    }
-    if resp.has_focus() {
-        painter.rect_stroke(rect, 6, v.selection.stroke, egui::StrokeKind::Inside);
-    }
-
-    let center = rect.left_center() + Vec2::new(24.0, 0.0);
-    if state == StepState::Done && !current {
-        paint_badge(painter, center, 13.0, Tone::Success, success_color(ui));
-    } else {
-        let (fill, ink) = if current {
-            (ACCENT, Color32::WHITE)
-        } else {
-            (Color32::TRANSPARENT, v.text_color())
-        };
-        painter.circle(
-            center,
-            13.0,
-            fill,
-            Stroke::new(1.5, if current { ACCENT } else { v.weak_text_color() }),
-        );
-        painter.text(
-            center,
-            egui::Align2::CENTER_CENTER,
-            number.to_string(),
-            FontId::proportional(14.0),
-            ink,
-        );
-    }
-
-    let x = rect.left() + 48.0;
-    painter.text(
-        egui::pos2(x, rect.top() + 8.0),
-        egui::Align2::LEFT_TOP,
-        title,
-        FontId::proportional(16.0),
-        if current {
-            v.strong_text_color()
-        } else {
-            v.text_color()
-        },
-    );
-    let (tone, color) = match state {
-        StepState::Error => (Some(Tone::Error), error_color(ui)),
-        StepState::Warning => (Some(Tone::Warning), warning_color(ui)),
-        _ => (None, v.weak_text_color()),
-    };
-    let mut sx = x;
-    if let Some(tone) = tone {
-        paint_badge(
-            painter,
-            egui::pos2(x + 6.0, rect.top() + 38.0),
-            6.5,
-            tone,
-            color,
-        );
-        sx += 17.0;
-    }
-    painter.text(
-        egui::pos2(sx, rect.top() + 30.0),
-        egui::Align2::LEFT_TOP,
-        status,
-        FontId::proportional(13.5),
-        color,
-    );
-    resp
-}
-
-fn error_color(ui: &egui::Ui) -> Color32 {
-    if ui.visuals().dark_mode {
-        Color32::from_rgb(255, 120, 110)
-    } else {
-        Color32::from_rgb(180, 30, 25)
-    }
-}
-
-fn warning_color(ui: &egui::Ui) -> Color32 {
-    if ui.visuals().dark_mode {
-        Color32::from_rgb(245, 190, 80)
-    } else {
-        Color32::from_rgb(150, 90, 0)
-    }
-}
-
-fn success_color(ui: &egui::Ui) -> Color32 {
-    if ui.visuals().dark_mode {
-        Color32::from_rgb(110, 200, 130)
-    } else {
-        Color32::from_rgb(20, 120, 50)
-    }
-}
-
-fn primary(text: RichText) -> egui::Button<'static> {
-    egui::Button::new(text.strong().color(Color32::WHITE))
-        .fill(ACCENT)
-        .min_size(Vec2::new(0.0, 36.0))
-}
-
-fn primary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    ui.add(primary(RichText::new(label)))
-}
-
-/// Bold label, an optional "Required"/"Optional" tag, and hint text below.
-fn field_label(ui: &mut egui::Ui, label: &str, tag: Option<&str>, hint: &str) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(label).size(17.0).strong());
-        if let Some(tag) = tag {
-            let text = RichText::new(format!("({})", tag.to_lowercase()));
-            ui.label(if tag == "Required" {
-                text.strong()
-            } else {
-                text.weak()
-            });
-        }
-    });
-    if !hint.is_empty() {
-        ui.label(RichText::new(hint).weak());
-    }
-}
-
-/// The page-and-magnifier mark from the loading screen, drawn with shapes.
-fn app_mark(ui: &mut egui::Ui, size: f32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
-    let p = ui.painter();
-    let u = size / 76.0; // the loading screen's SVG is 76 units wide
-    let at = |x: f32, y: f32| rect.min + Vec2::new(x * u, y * u);
-    let ink = ui.visuals().weak_text_color();
-    let accent = tone_color(ui, Tone::Info);
-    p.rect(
-        egui::Rect::from_min_max(at(12.0, 8.0), at(52.0, 60.0)),
-        5.0 * u,
-        ui.visuals().extreme_bg_color,
-        Stroke::new(2.5 * u, ink),
-        egui::StrokeKind::Middle,
-    );
-    for (y, w) in [(19.0, 26.0), (28.0, 20.0), (37.0, 24.0)] {
-        p.rect_filled(
-            egui::Rect::from_min_size(at(19.0, y), Vec2::new(w, 3.5) * u),
-            1.75 * u,
-            ink,
-        );
-    }
-    p.circle(
-        at(42.0, 40.0),
-        12.0 * u,
-        accent.gamma_multiply(0.25),
-        Stroke::new(3.5 * u, accent),
-    );
-    p.line_segment(
-        [at(51.0, 49.0), at(62.0, 60.0)],
-        Stroke::new(5.0 * u, accent),
-    );
-}
-
-/// "1  Text" with the number in a small circle, for short lists of steps.
-fn numbered(ui: &mut egui::Ui, n: usize, text: &str) {
-    ui.horizontal_top(|ui| {
-        ui.spacing_mut().item_spacing.x = 10.0;
-        let (rect, _) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
-        let color = ui.visuals().weak_text_color();
-        ui.painter()
-            .circle_stroke(rect.center(), 10.0, Stroke::new(1.3, color));
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            n.to_string(),
-            FontId::proportional(13.0),
-            ui.visuals().text_color(),
-        );
-        ui.add(egui::Label::new(text).wrap());
-    });
-}
-
-/// A tinted box with a colored edge, a badge and a title.
-fn callout(ui: &mut egui::Ui, tone: Tone, title: &str, body: impl FnOnce(&mut egui::Ui)) {
-    let color = tone_color(ui, tone);
-    let tint = if ui.visuals().dark_mode { 0.10 } else { 0.07 };
-    let inner = egui::Frame::new()
-        .fill(color.gamma_multiply(tint))
-        .stroke(Stroke::new(1.0, color.gamma_multiply(0.35)))
-        .corner_radius(8)
-        .inner_margin(Margin {
-            left: 20,
-            right: 14,
-            top: 10,
-            bottom: 12,
-        })
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                badge(ui, tone, 18.0);
-                ui.label(
-                    RichText::new(title)
-                        .strong()
-                        .color(ui.visuals().strong_text_color()),
-                );
-            });
-            ui.add_space(2.0);
-            body(ui);
-        });
-    let r = inner.response.rect;
-    ui.painter().rect_filled(
-        egui::Rect::from_min_size(r.min, Vec2::new(4.0, r.height())),
-        egui::CornerRadius {
-            nw: 8,
-            sw: 8,
-            ne: 0,
-            se: 0,
-        },
-        color,
-    );
-}
 
 fn optional_section(
     ui: &mut egui::Ui,
@@ -2915,66 +2223,6 @@ fn download(name: &str, bytes: &[u8], mime: &str) -> Result<(), String> {
     a.click();
     let _ = web_sys::Url::revoke_object_url(&url);
     Ok(())
-}
-
-/// Ask the browser for a .req file; its bytes land in `slot` and the app is woken to open it.
-#[cfg(target_arch = "wasm32")]
-fn pick_file(slot: Incoming, ctx: egui::Context) {
-    use wasm_bindgen::JsCast;
-    let Some(input) = web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.create_element("input").ok())
-        .and_then(|e| e.dyn_into::<web_sys::HtmlInputElement>().ok())
-    else {
-        return;
-    };
-    input.set_type("file");
-    input.set_accept(&format!(".{}", reqfile::EXTENSION));
-    let picked = input.clone();
-    let on_change = wasm_bindgen::closure::Closure::once_into_js(move || {
-        let Some(file) = picked.files().and_then(|f| f.get(0)) else {
-            return;
-        };
-        wasm_bindgen_futures::spawn_local(async move {
-            if let Ok(buf) = wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await {
-                *slot.borrow_mut() = Some((file.name(), js_sys::Uint8Array::new(&buf).to_vec()));
-                ctx.request_repaint();
-            }
-        });
-    });
-    input.set_onchange(Some(on_change.unchecked_ref()));
-    input.click();
-}
-
-/// Where the app can be opened, for the email: the page's own address on the web.
-fn app_url() -> Option<String> {
-    #[cfg(target_arch = "wasm32")]
-    {
-        let loc = web_sys::window()?.location();
-        Some(format!("{}{}", loc.origin().ok()?, loc.pathname().ok()?))
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    None
-}
-
-/// While a file is dragged over the window, say what dropping it will do.
-fn drop_hint(ctx: &egui::Context) {
-    if ctx.input(|i| i.raw.hovered_files.is_empty()) {
-        return;
-    }
-    let rect = ctx.content_rect();
-    let painter = ctx.layer_painter(egui::LayerId::new(
-        egui::Order::Foreground,
-        egui::Id::unique("drop_hint"),
-    ));
-    painter.rect_filled(rect, 0, Color32::from_black_alpha(150));
-    painter.text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        "Drop a request file (.req) to open it",
-        FontId::proportional(26.0),
-        Color32::WHITE,
-    );
 }
 
 #[cfg(not(target_arch = "wasm32"))]

@@ -1,8 +1,19 @@
+[workspace]
+members = [".", "runner"]
+
 [package]
 name = "keyql-builder"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+
+[lib]
+name = "keyql_builder"
+path = "src/lib.rs"
+
+[[bin]]
+name = "keyql-builder"
+path = "src/main.rs"
 
 [dependencies]
 chrono = { version = "0.4.45", features = ["serde"] }
@@ -28,10 +39,7 @@ web-sys = { version = "0.3", features = [
     "Document",
     "Element",
     "HtmlAnchorElement",
-    "File",
-    "FileList",
     "HtmlCanvasElement",
-    "HtmlInputElement",
     "Location",
     "Url",
     "Window",

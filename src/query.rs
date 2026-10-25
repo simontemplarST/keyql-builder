@@ -1357,22 +1357,13 @@ impl SearchRequest {
     }
 
     /// Subject and body for the email that goes with the file.
-    /// The email to the IT Director. `app_url` is where the app can be opened, when it runs on the web.
-    pub fn email(
-        &self,
-        file_name: &str,
-        app_url: Option<&str>,
-        today: NaiveDate,
-    ) -> (String, String) {
+    /// The email to the IT Director, who runs the attached file with the eDiscovery Search Runner.
+    pub fn email(&self, file_name: &str, today: NaiveDate) -> (String, String) {
         let subject = format!("eDiscovery search request: {}", self.display_name(today));
         let mut body = format!(
             "Hello,\n\nPlease run the Purview search in the attached request file ({file_name}).\n\
-             Open it in the eDiscovery Search Request app with \"Open a request file\" to see the \
-             details and copy the KeyQL query.\n"
+             Open it with the eDiscovery Search Runner to check the details and run the search.\n"
         );
-        if let Some(url) = app_url {
-            body.push_str(&format!("The app: {url}\n"));
-        }
         for (step, lines) in self.describe(today) {
             let Some(heading) = section_title(step) else {
                 continue;
@@ -1711,7 +1702,7 @@ mod tests {
             described[3].1,
             vec!["Dated between January 1, 2026 and October 23, 2026"]
         );
-        let (subject, body) = s.email("x.req", None, today());
+        let (subject, body) = s.email("x.req", today());
         assert_eq!(
             subject,
             "eDiscovery search request: Example - Highway 56 contract"
@@ -1747,7 +1738,7 @@ mod tests {
         assert_eq!(s.file_name(today()), "Data request 2026-10-23.req");
         assert_eq!(s.display_name(today()), "Data request October 23, 2026");
         assert!(s.build_at(today()).can_save());
-        let (subject, _) = s.email("x.req", None, today());
+        let (subject, _) = s.email("x.req", today());
         assert_eq!(
             subject,
             "eDiscovery search request: Data request October 23, 2026"
