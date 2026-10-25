@@ -1,0 +1,1 @@
+("Highway 56" AND contract AND (sent:2026-01-01..2026-10-25 OR received:2026-01-01..2026-10-25 OR LastModifiedTime:2026-01-01..2026-10-25) AND (kind:email OR kind:docs) AND HasAttachment:true) NOT newsletter
