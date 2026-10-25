@@ -340,7 +340,11 @@ impl KeyqlApp {
         ui.add_space(12.0);
         ui.separator();
         ui.label(
-            RichText::new("Your answers are kept if you close the app.")
+            RichText::new(if cfg!(target_arch = "wasm32") {
+                "Your answers are kept in this browser only, even if you close the tab. Nothing is uploaded."
+            } else {
+                "Your answers are kept if you close the app."
+            })
                 .small()
                 .weak(),
         );
@@ -1044,7 +1048,11 @@ impl KeyqlApp {
         });
         ui.label(
             RichText::new(
-                "You'll choose where to save it. Next, you'll email the file to the IT Director.",
+                if cfg!(target_arch = "wasm32") {
+                    "Your browser will download it. Next, you'll email the file to the IT Director."
+                } else {
+                    "You'll choose where to save it. Next, you'll email the file to the IT Director."
+                },
             )
             .weak(),
         );
@@ -1060,6 +1068,7 @@ impl KeyqlApp {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn save_file(&mut self, built: &query::Built) {
         let name = self.req.file_name(today());
         let mut dialog = rfd::FileDialog::new()
@@ -1095,6 +1104,20 @@ impl KeyqlApp {
         }
     }
 
+    /// In the browser there's no save dialog: the file is downloaded and lands
+    /// wherever the browser keeps downloads.
+    #[cfg(target_arch = "wasm32")]
+    fn save_file(&mut self, built: &query::Built) {
+        let name = self.req.file_name(today());
+        match download(&name, &built.query) {
+            Ok(()) => {
+                self.saved = Some(PathBuf::from(name));
+                self.save_error = None;
+            }
+            Err(e) => self.save_error = Some(e),
+        }
+    }
+
     fn done_page(&mut self, ui: &mut egui::Ui) {
         let Some(path) = self.saved.clone() else {
             return;
@@ -1103,10 +1126,13 @@ impl KeyqlApp {
             .file_name()
             .map(|f| f.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let folder = path
-            .parent()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
+        let folder = if cfg!(target_arch = "wasm32") {
+            "your browser's Downloads folder".to_owned()
+        } else {
+            path.parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        };
 
         egui::Frame::new()
             .fill(success_color(ui).gamma_multiply(0.18))
@@ -1137,8 +1163,9 @@ impl KeyqlApp {
                 .clicked()
             {
                 let to = self.settings.it_director_email.trim();
-                let _ = open::that(mailto(to, &subject, &body));
+                open_link(ui.ctx(), &mailto(to, &subject, &body));
             }
+            #[cfg(not(target_arch = "wasm32"))]
             if ui.button("📂 Show the file in its folder").clicked()
                 && let Some(dir) = path.parent()
             {
@@ -1721,6 +1748,43 @@ fn simple_date(ui: &mut egui::Ui, key: &str, date: &mut NaiveDate) -> bool {
     false
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn open_link(_ctx: &egui::Context, url: &str) {
+    let _ = open::that(url);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn open_link(ctx: &egui::Context, url: &str) {
+    ctx.open_url(egui::OpenUrl::same_tab(url));
+}
+
+/// Hand `text` to the browser as a file download named `name`.
+#[cfg(target_arch = "wasm32")]
+fn download(name: &str, text: &str) -> Result<(), String> {
+    use wasm_bindgen::JsCast;
+    let err = |e: wasm_bindgen::JsValue| format!("{e:?}");
+
+    let parts = js_sys::Array::of1(&text.into());
+    let opts = web_sys::BlobPropertyBag::new();
+    opts.set_type("text/plain;charset=utf-8");
+    let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &opts).map_err(err)?;
+    let url = web_sys::Url::create_object_url_with_blob(&blob).map_err(err)?;
+    let document = web_sys::window()
+        .and_then(|w| w.document())
+        .ok_or("no document")?;
+    let a: web_sys::HtmlAnchorElement = document
+        .create_element("a")
+        .map_err(err)?
+        .dyn_into()
+        .map_err(|_| "not an anchor".to_owned())?;
+    a.set_href(&url);
+    a.set_download(name);
+    a.click();
+    let _ = web_sys::Url::revoke_object_url(&url);
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn documents_dir() -> Option<PathBuf> {
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
     let docs = PathBuf::from(home).join("Documents");

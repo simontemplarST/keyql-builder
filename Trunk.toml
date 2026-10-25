@@ -1,0 +1,6 @@
+# Trunk records the .wasm size from before wasm-opt, so the loading bar (loader.mjs) would stop near 70%.
+# Put the size of the file that is actually served into index.html.
+[[hooks]]
+stage = "post_build"
+command = "sh"
+command_arguments = ["-c", "set -e; w=$(ls \"$TRUNK_STAGING_DIR\"/*_bg.wasm); n=$(wc -c < \"$w\"); sed -i -E \"s/(_bg\\.wasm', )[0-9]+/\\1$n/\" \"$TRUNK_STAGING_DIR/index.html\""]

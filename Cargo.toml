@@ -8,6 +8,26 @@ chrono = { version = "0.4.45", features = ["serde"] }
 eframe = { version = "0.37.0", features = ["persistence"] }
 egui_extras = { version = "0.37.0", features = ["datepicker", "serde"] }
 jiff = { version = "0.2.38", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 open = "5.4.5"
 rfd = "0.17.2"
-serde = { version = "1.0.229", features = ["derive"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+chrono = { version = "0.4.45", features = ["serde", "wasmbind"] }
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "Blob",
+    "BlobPropertyBag",
+    "console",
+    "Document",
+    "Element",
+    "HtmlAnchorElement",
+    "HtmlCanvasElement",
+    "Location",
+    "Url",
+    "Window",
+] }

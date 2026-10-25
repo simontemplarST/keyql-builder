@@ -87,6 +87,22 @@ cargo run --release -- --example # start on the review page with a sample reques
 cargo test                       # query generator and UI helper tests
 ```
 
+### In a web browser
+
+The same app also builds to WebAssembly and runs in a browser tab. Install the wasm
+target and [trunk](https://trunkrs.dev) once, then serve it locally:
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install --locked trunk
+trunk serve --release            # http://127.0.0.1:8080  (add ?example for the sample request)
+trunk build --release            # static files in dist/, servable from any web server
+```
+
+In the browser, **Save request file…** downloads the `.kql` file to the browser's
+Downloads folder, and **Show the file in its folder** is hidden. Answers and settings
+are kept in the browser's local storage.
+
 On Windows the release build opens no console window. Saved answers live in
 `~/.local/share/keyql-builder/` on Linux and `%APPDATA%\keyql-builder\` on Windows.
 
